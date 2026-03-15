@@ -62,7 +62,7 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "Usage: ./demo checkpoint path tokenizer path";
     return -1;
   }
-  printf("315555555\n");
+  printf("31666\n");
   const char* checkpoint_path = argv[1];  // e.g. out/model.bin
   const char* tokenizer_path = argv[2];
 

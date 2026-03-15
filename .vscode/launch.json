@@ -1,0 +1,76 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试 qwen3_infer",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/demo/qwen3_infer",
+      "args": [
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/qwen0.6.bin2",
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/tokenizer.json"
+      ],
+      "cwd": "${workspaceFolder}/build/demo",
+      "stopAtEntry": false,
+      "preLaunchTask": "编译 qwen3_infer",
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "为 gdb 启用整齐打印",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "运行 qwen3_infer（不调试）",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/demo/qwen3_infer",
+      "args": [
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/qwen0.6.bin2",
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/tokenizer.json"
+      ],
+      "cwd": "${workspaceFolder}/build/demo",
+      "stopAtEntry": false,
+      "preLaunchTask": "编译 qwen3_infer",
+      "MIMode": "gdb"
+    },
+    {
+      "name": "运行 bench_qwen3",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/demo/bench_qwen3",
+      "args": [
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/qwen0.6.bin2",
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/tokenizer.json",
+        "128",
+        "3"
+      ],
+      "cwd": "${workspaceFolder}/build/demo",
+      "stopAtEntry": false,
+      "preLaunchTask": "编译 bench_qwen3",
+      "MIMode": "gdb"
+    },
+    {
+      "name": "调试 qwen3_infer（跳过编译）",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/demo/qwen3_infer",
+      "args": [
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/qwen0.6.bin2",
+        "/home/dzy/za/kpllama/qwen306/qwen3-0.6b/tokenizer.json"
+      ],
+      "cwd": "${workspaceFolder}/build/demo",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "为 gdb 启用整齐打印",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}

@@ -9,6 +9,7 @@
 #include <utility>
 #include "../op/kernels/cpu/rope_kernel.h"
 #include "../op/kernels/cuda/rope_kernel.cuh"
+#include "base/profiler.h"
 #include "base/tick.h"
 namespace model {
 
@@ -119,6 +120,7 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
     cudaSetDevice(0);
     cuda_config_ = std::make_shared<kernel::CudaConfig>();
     cudaStreamCreate(&cuda_config_->stream);
+    base::OpProfiler::instance().set_stream(cuda_config_->stream);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
       return error::InternalError("The cuda hanle create failed.");
@@ -155,15 +157,12 @@ base::Status Qwen3Model::forward(const tensor::Tensor& input, const tensor::Tens
   }
 
   for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
-    attention_rms(layer_idx, input);
-    // attention (wq wk wv @ input)
-    attention_qkv(layer_idx, pos_tensor);
-    // multi-head attention
-    attention_mha(layer_idx, pos_tensor);
-    // feed forward
-    feed_forward(layer_idx, input);
+    { PROFILE_SCOPE("AttnRMSNorm"); attention_rms(layer_idx, input); }
+    { PROFILE_SCOPE("AttnQKV"); attention_qkv(layer_idx, pos_tensor); }
+    { PROFILE_SCOPE("MHA"); attention_mha(layer_idx, pos_tensor); }
+    { PROFILE_SCOPE("FeedForward"); feed_forward(layer_idx, input); }
   }
-  cls_logits(input);
+  { PROFILE_SCOPE("CLSLogits"); cls_logits(input); }
   return base::error::Success();
 }
 
@@ -470,47 +469,39 @@ void Qwen3Model::attention_rms(int32_t layer_idx, const tensor::Tensor& input) c
 
 void Qwen3Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(qwen_layers_ != nullptr);
-  // kv cache
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   int32_t pos = pos_tensor.index<int32_t>(0);
-  // wq wk wv @ input
   auto [key, val] = slice_kv_cache(layer_idx, pos);
 
-  // query
   const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
   CHECK_NE(query_layer, nullptr) << "The query layer in the attention block is null pointer.";
 
   auto rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
-  STATUS_CHECK(query_layer->forward(rmsnorm_output, query));
+  { PROFILE_SCOPE("MatMul_WQ"); STATUS_CHECK(query_layer->forward(rmsnorm_output, query)); }
 
-  // query norm
   auto query_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 2 * config_->layer_num_ + 1);
   query.reshape({(int32_t)query.size() / config_->head_size_, config_->head_size_});
-  query_norm->forward(query, query);
+  { PROFILE_SCOPE("QNorm"); query_norm->forward(query, query); }
   query.reshape({(int32_t)query.size()});
 
-  // key
   const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
   CHECK_NE(key_layer, nullptr) << "The key layer in the attention block is null pointer.";
-  STATUS_CHECK(key_layer->forward(rmsnorm_output, key));
+  { PROFILE_SCOPE("MatMul_WK"); STATUS_CHECK(key_layer->forward(rmsnorm_output, key)); }
 
-  // key norm
   auto key_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 3 * config_->layer_num_ + 1);
   key.reshape({(int32_t)key.size() / config_->head_size_, config_->head_size_});
-  key_norm->forward(key, key);
+  { PROFILE_SCOPE("KNorm"); key_norm->forward(key, key); }
   key.reshape({(int32_t)key.size()});
 
-  // value
   const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
   CHECK_NE(value_layer, nullptr) << "The value layer in the attention block is null pointer.";
-  STATUS_CHECK(value_layer->forward(rmsnorm_output, val));
+  { PROFILE_SCOPE("MatMul_WV"); STATUS_CHECK(value_layer->forward(rmsnorm_output, val)); }
 
-  // rope
   CHECK_NE(qwen_layers_->rope_layer_, nullptr)
       << "The RoPE layer in the attention block is null pointer.";
-  STATUS_CHECK(qwen_layers_->rope_layer_->forward(
+  { PROFILE_SCOPE("RoPE"); STATUS_CHECK(qwen_layers_->rope_layer_->forward(
       query, key, pos_tensor, get_buffer(ModelBufferType::kSinCache),
-      get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
+      get_buffer(ModelBufferType::kCosCache), tensor::Tensor{})); }
 }
 
 base::Status Qwen3Model::predict(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
@@ -525,10 +516,7 @@ base::Status Qwen3Model::predict(const tensor::Tensor& input, const tensor::Tens
 
 void Qwen3Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(qwen_layers_ != nullptr);
-  // mha
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
-  // VAL = [val1,val2,...val t]
-  // output @ VAL = 最终的结果
   tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
 
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
@@ -540,57 +528,49 @@ void Qwen3Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
   int pos = pos_tensor.index<int32_t>(0);
   std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(pos);
   std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
-  STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output));
+  { PROFILE_SCOPE("MHA_Kernel"); STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output)); }
 
-  // wo @ attention output
   tensor::Tensor attn_output = get_buffer(ModelBufferType::kAttnOutput);
   const auto& wo_layer = qwen_layers_->wo_layers_.at(layer_idx);
   CHECK_NE(wo_layer, nullptr) << "The weight output layer is null pointer.";
-  STATUS_CHECK(wo_layer->forward(mha_output, attn_output));
+  { PROFILE_SCOPE("MatMul_WO"); STATUS_CHECK(wo_layer->forward(mha_output, attn_output)); }
 }
 
 void Qwen3Model::feed_forward(int32_t layer_idx, const tensor::Tensor& input) const {
   CHECK(qwen_layers_ != nullptr);
-  // residual add
   CHECK_NE(qwen_layers_->add_layer_, nullptr)
       << "The add layer in the feedforward block is null pointer";
-  STATUS_CHECK(
-      qwen_layers_->add_layer_->forward(input, get_buffer(ModelBufferType::kAttnOutput), input));
+  { PROFILE_SCOPE("ResidualAdd"); STATUS_CHECK(
+      qwen_layers_->add_layer_->forward(input, get_buffer(ModelBufferType::kAttnOutput), input)); }
 
-  // ffn rmsnorm (post attention layernorm)
   tensor::Tensor ffn_norm_output = get_buffer(ModelBufferType::kFFNRMSNorm);
   const auto& ffn_rmsnorm = qwen_layers_->rmsnorm_layers_.at(layer_idx + config_->layer_num_);
   CHECK_NE(ffn_rmsnorm, nullptr)
       << "The final rmsnorm layer in the feedforward block is null pointer";
-  STATUS_CHECK(ffn_rmsnorm->forward(input, ffn_norm_output));
+  { PROFILE_SCOPE("FFN_RMSNorm"); STATUS_CHECK(ffn_rmsnorm->forward(input, ffn_norm_output)); }
 
-  // w1
   tensor::Tensor w1_output = get_buffer(ModelBufferType::kW1Output);
   const auto& w1_layer = qwen_layers_->w1_layers_.at(layer_idx);
   CHECK_NE(w1_layer, nullptr) << "The w1 layer in the feedforward block is null pointer";
-  STATUS_CHECK(w1_layer->forward(ffn_norm_output, w1_output));
+  { PROFILE_SCOPE("MatMul_W1"); STATUS_CHECK(w1_layer->forward(ffn_norm_output, w1_output)); }
 
-  // w3
   tensor::Tensor w3_ouput = get_buffer(ModelBufferType::kW3Output);
   const auto& w3_layer = qwen_layers_->w3_layers_.at(layer_idx);
   CHECK_NE(w3_layer, nullptr) << "The w3 layer in the feedforward block is null pointer";
-  STATUS_CHECK(w3_layer->forward(ffn_norm_output, w3_ouput));
+  { PROFILE_SCOPE("MatMul_W3"); STATUS_CHECK(w3_layer->forward(ffn_norm_output, w3_ouput)); }
 
-  // SwiGLU
   CHECK_NE(qwen_layers_->swiglu_layer_, nullptr)
       << "The swiglu layer in the feedforward block is null pointer";
-  STATUS_CHECK(qwen_layers_->swiglu_layer_->forward(w1_output, w3_ouput, w1_output));
+  { PROFILE_SCOPE("SwiGLU"); STATUS_CHECK(qwen_layers_->swiglu_layer_->forward(w1_output, w3_ouput, w1_output)); }
 
-  // w2
   tensor::Tensor w2_output = get_buffer(ModelBufferType::kW2Output);
   const auto& w2_layer = qwen_layers_->w2_layers_.at(layer_idx);
   CHECK_NE(w2_layer, nullptr) << "The w2 layer in the feedforward block is null pointer";
-  STATUS_CHECK(w2_layer->forward(w1_output, w2_output));
+  { PROFILE_SCOPE("MatMul_W2"); STATUS_CHECK(w2_layer->forward(w1_output, w2_output)); }
 
-  // residual add
   CHECK_NE(qwen_layers_->add_layer_, nullptr)
       << "The add layer in the feedforward block is null pointer";
-  STATUS_CHECK(qwen_layers_->add_layer_->forward(input, w2_output, input));
+  { PROFILE_SCOPE("ResidualAdd"); STATUS_CHECK(qwen_layers_->add_layer_->forward(input, w2_output, input)); }
 }
 
 op::EmbeddingOutput Qwen3Model::embedding(const std::vector<int>& tokens) const {
