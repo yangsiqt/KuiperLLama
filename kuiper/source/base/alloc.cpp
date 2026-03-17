@@ -1,4 +1,5 @@
 #include "base/alloc.h"
+#include <cstring>
 #include <cuda_runtime_api.h>
 namespace base {
 void DeviceAllocator::memcpy(const void* src_ptr, void* dest_ptr, size_t byte_size,

@@ -50,6 +50,8 @@ if (ENABLE_NVTX)
     set(ENABLE_NVTX OFF)
   endif()
 endif()
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+
 # ---- Add dependencies via CPM ----
 # see https://github.com/TheLartians/CPM.cmake for more info
 option(USE_CPM "Use CPM for dependency management" OFF)
@@ -122,6 +124,11 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
 
 add_library(llama SHARED ${DIR_TENSOR} ${DIR_BASE} ${DIR_OP} ${DIR_KERNEL} ${DIR_MODEL} ${DIR_KERNEL_CPU} ${DIR_KERNEL_CUDA} ${DIR_KERNEL} ${DIR_SAMPLE})
 target_link_libraries(llama sentencepiece glog::glog gtest gtest_main pthread cudart armadillo)
+if (LLAMA3_SUPPORT OR QWEN2_SUPPORT OR QWEN3_SUPPORT)
+  find_package(absl REQUIRED)
+  find_package(re2 REQUIRED)
+  target_link_libraries(llama absl::strings re2::re2)
+endif()
 if (ENABLE_NVTX AND NVTX_LIBRARY)
   target_link_libraries(llama ${NVTX_LIBRARY})
 endif()

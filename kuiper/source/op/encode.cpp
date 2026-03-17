@@ -83,8 +83,7 @@ BpeEncodeLayer::BpeEncodeLayer(std::string token_model_path, bool has_bos, bool 
 
   ankerl::unordered_dense::map<std::string, int> encoder;
   const auto& vocabs = data["model"]["vocab"];
-  const auto& vocab_items = vocabs.items();
-  for (const auto& v : vocab_items) {
+  for (auto&& v : vocabs.items()) {
     const auto cpts = unicode_cpts_from_utf8(v.key());
     std::string key;
     for (const auto cpt : cpts) {
@@ -159,8 +158,7 @@ QwenEncodeLayer::QwenEncodeLayer(std::string token_model_path, bool has_bos, boo
 
   ankerl::unordered_dense::map<std::string, int> encoder;
   const auto& vocabs = data["model"]["vocab"];
-  const auto& vocab_items = vocabs.items();
-  for (const auto& v : vocab_items) {
+  for (auto&& v : vocabs.items()) {
     const auto cpts = unicode_cpts_from_utf8(v.key());
     std::string key;
     for (const auto cpt : cpts) {
