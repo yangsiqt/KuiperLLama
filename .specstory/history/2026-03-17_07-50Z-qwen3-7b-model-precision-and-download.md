@@ -3719,3 +3719,20 @@ echo $HF_ENDPOINT
 
 ---
 
+_**User**_
+
+(base) root@oufbace2:/home/dzy/KuiperLLama# git add .
+(base) root@oufbace2:/home/dz
+(base) root@oufbace2:/home/dzy/KuiperLLama# git commit -m "add int4 awq"
+[feature/quan f1778e1] add int4 awq
+ 22 files changed, 5685 insertions(+), 43 deletions(-)
+ create mode 100644 tools/export_qwen3/README_Qwen3-8B.md
+ create mode 100644 tools/export_qwen3/__pycache__/config.cpython-313.pyc
+ create mode 100644 tools/export_qwen3/__pycache__/model.cpython-313.pyc
+ create mode 100644 tools/export_qwen3/export_direct.py
+ create mode 100644 tools/export_qwen3/export_int4.py
+ create mode 100644 tools/export_qwen3/export_int4_awq.py
+(base) root@oufbace2:/home/dzy/KuiperLLama#  怎么把这个代码推送到我的GitHub上
+
+---
+

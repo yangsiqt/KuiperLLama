@@ -27,7 +27,8 @@ static void tee_printf(const char* fmt, ...) {
   va_end(args);
 }
 
-static std::string create_log_file(const char* project_root, const char* tag) {
+static std::string create_log_file(const char* project_root, const char* tag,
+                                   int prompt_tokens, int max_tokens, int bench_runs) {
   std::string logs_dir = std::string(project_root) + "/logs";
   mkdir(logs_dir.c_str(), 0755);
 
@@ -38,13 +39,13 @@ static std::string create_log_file(const char* project_root, const char* tag) {
   struct tm tm_buf;
   localtime_r(&t, &tm_buf);
 
-  char filename[256];
+  char filename[512];
   snprintf(filename, sizeof(filename),
-           "%s/bench_%s_%04d%02d%02d_%02d%02d%02d_%03d.md",
+           "%s/bench_%s_p%d_d%d_r%d_%04d%02d%02d_%02d%02d%02d.md",
            logs_dir.c_str(), tag,
+           prompt_tokens, max_tokens, bench_runs,
            tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-           tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
-           static_cast<int>(ms.count()));
+           tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
 
   g_log_file = fopen(filename, "w");
   if (!g_log_file) {
@@ -195,7 +196,9 @@ void print_markdown_report(const std::vector<BenchResult>& results, const BenchC
   tee_printf("| GPU | %s |\n", prop.name);
   tee_printf("| VRAM | %.1f GB |\n", prop.totalGlobalMem / 1073741824.0);
   tee_printf("| CUDA Cores | %d |\n", prop.multiProcessorCount);
-  tee_printf("| Model | Qwen3 |\n");
+  tee_printf("| Model | Qwen3 (quant: %s) |\n",
+             config.checkpoint_path.find("int4") != std::string::npos ? "INT4" :
+             config.checkpoint_path.find("int8") != std::string::npos ? "INT8" : "FP32");
   tee_printf("| Checkpoint | %s |\n", config.checkpoint_path.c_str());
   tee_printf("| Prompt | \"%s\" |\n", config.prompt.c_str());
   tee_printf("| Max Tokens | %d |\n", config.max_tokens);
@@ -255,13 +258,36 @@ static void tee_print_profiler_report(const base::OpProfiler& profiler) {
   tee_printf("\nTotal operator time: %.2f ms\n", profiler.total_ms());
 }
 
+static std::string make_long_prompt(const model::Qwen3Model& model, const std::string& seed,
+                                    int target_tokens) {
+  auto seed_tokens = model.encode(seed);
+  int seed_len = static_cast<int>(seed_tokens.size());
+  if (seed_len >= target_tokens) return seed;
+
+  int repeats = (target_tokens / seed_len) + 1;
+  std::string long_prompt;
+  for (int i = 0; i < repeats; ++i) {
+    if (i > 0) long_prompt += " Furthermore, ";
+    long_prompt += seed;
+  }
+  auto final_tokens = model.encode(long_prompt);
+  while (static_cast<int>(final_tokens.size()) > target_tokens && long_prompt.size() > 100) {
+    long_prompt = long_prompt.substr(0, long_prompt.size() - 50);
+    final_tokens = model.encode(long_prompt);
+  }
+  return long_prompt;
+}
+
 int main(int argc, char* argv[]) {
   if (argc < 3) {
-    printf("Usage: %s <checkpoint_path> <tokenizer_path> [max_tokens] [bench_runs] [prompt]\n",
-           argv[0]);
-    printf("  max_tokens  : max tokens to generate (default: 128)\n");
-    printf("  bench_runs  : number of benchmark iterations (default: 3)\n");
-    printf("  prompt      : input prompt string (default: built-in)\n");
+    printf(
+        "Usage: %s <checkpoint> <tokenizer> [max_tokens] [bench_runs] [quant_bits] "
+        "[prompt_tokens]\n",
+        argv[0]);
+    printf("  max_tokens    : max tokens to generate (default: 512)\n");
+    printf("  bench_runs    : number of benchmark iterations (default: 10)\n");
+    printf("  quant_bits    : 0=FP32, 4=INT4, 8=INT8 (default: 0)\n");
+    printf("  prompt_tokens : target prompt length in tokens (default: 0=use built-in)\n");
     return 1;
   }
 
@@ -270,7 +296,10 @@ int main(int argc, char* argv[]) {
   config.tokenizer_path = argv[2];
   if (argc >= 4) config.max_tokens = std::atoi(argv[3]);
   if (argc >= 5) config.bench_runs = std::atoi(argv[4]);
-  if (argc >= 6) config.prompt = argv[5];
+  int quant_bits = 0;
+  if (argc >= 6) quant_bits = std::atoi(argv[5]);
+  int target_prompt_tokens = 0;
+  if (argc >= 7) target_prompt_tokens = std::atoi(argv[6]);
 
 #ifdef USE_NAIVE_MHA
   const char* mha_tag = "naive";
@@ -278,14 +307,20 @@ int main(int argc, char* argv[]) {
   const char* mha_tag = "flash";
 #endif
 
-  std::string log_path = create_log_file("/home/dzy/za/kpllama/KuiperLLama", mha_tag);
+  std::string quant_tag = quant_bits > 0 ? std::string("int") + std::to_string(quant_bits) : "fp32";
+  std::string full_tag = std::string(mha_tag) + "_" + quant_tag;
+
+  std::string log_path = create_log_file("/home/dzy/KuiperLLama", full_tag.c_str(),
+                                          target_prompt_tokens > 0 ? target_prompt_tokens : 0,
+                                          config.max_tokens, config.bench_runs);
   if (g_log_file) {
     tee_printf("Log file: %s\n", log_path.c_str());
   }
 
-  tee_printf("Loading model...\n");
+  bool is_quant = (quant_bits == 4 || quant_bits == 8);
+  tee_printf("Loading model (quant_bits=%d)...\n", quant_bits);
   model::Qwen3Model model(base::TokenizerType::kEncodeBpe, config.tokenizer_path,
-                           config.checkpoint_path, false);
+                           config.checkpoint_path, is_quant, quant_bits);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "Model init failed: " << init_status.get_err_code();
@@ -294,6 +329,13 @@ int main(int argc, char* argv[]) {
   auto& profiler = base::OpProfiler::instance();
 
   tee_printf("Model loaded. GPU memory after load: %.1f MB\n\n", get_gpu_memory_used() / 1048576.0);
+
+  if (target_prompt_tokens > 0) {
+    config.prompt = make_long_prompt(model, config.prompt, target_prompt_tokens);
+    auto check_tokens = model.encode(fill_template(config.prompt));
+    tee_printf("Generated long prompt: %d tokens (target: %d)\n\n",
+               static_cast<int>(check_tokens.size()), target_prompt_tokens);
+  }
 
   tee_printf("Warming up (%d runs)...\n", config.warmup_runs);
   for (int i = 0; i < config.warmup_runs; ++i) {
