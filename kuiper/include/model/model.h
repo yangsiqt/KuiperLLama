@@ -80,6 +80,7 @@ class Model {
 
  protected:
   int32_t group_size_ = 1;
+  int32_t quant_bits_ = 8;
   bool is_quant_model_ = false;
   std::unique_ptr<TransformerConfig> config_;
 

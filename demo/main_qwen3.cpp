@@ -1,6 +1,7 @@
 #include <base/base.h>
 #include <base/tick.h>
 #include <glog/logging.h>
+#include <cstdlib>
 #include "model/qwen3.h"
 int32_t generate(const model::Qwen3Model& model, const std::string& sentence, int total_steps,
                  bool need_output = false) {
@@ -58,15 +59,21 @@ std::string fill_template(const std::string& content) {
 }
 
 int main(int argc, char* argv[]) {
-  if (argc != 3) {
-    LOG(INFO) << "Usage: ./demo checkpoint path tokenizer path";
+  if (argc < 3 || argc > 4) {
+    LOG(INFO) << "Usage: ./qwen3_infer checkpoint_path tokenizer_path [quant_bits]";
+    LOG(INFO) << "  quant_bits: 0=FP32(default), 8=INT8, 4=INT4";
     return -1;
   }
-  printf("31666\n");
-  const char* checkpoint_path = argv[1];  // e.g. out/model.bin
+  const char* checkpoint_path = argv[1];
   const char* tokenizer_path = argv[2];
+  int quant_bits = 0;
+  if (argc == 4) {
+    quant_bits = std::atoi(argv[3]);
+  }
 
-  model::Qwen3Model model(base::TokenizerType::kEncodeBpe, tokenizer_path, checkpoint_path, false);
+  bool is_quant = (quant_bits == 4 || quant_bits == 8);
+  model::Qwen3Model model(base::TokenizerType::kEncodeBpe, tokenizer_path, checkpoint_path,
+                           is_quant, quant_bits);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();

@@ -29,6 +29,13 @@ base::Status MatmulLayer::check() const {
       LOG(ERROR) << "The weight tensor error in the matmul layer.";
       return status;
     }
+  } else if (quant_bits_ == 4) {
+    status = check_tensor_with_dim(get_weight(0), device_type_, base::DataType::kDataTypeInt8,
+                                   dim0_, dim1_ / 2);
+    if (!status) {
+      LOG(ERROR) << "The weight tensor error in the matmul layer (INT4).";
+      return status;
+    }
   } else {
     status = check_tensor_with_dim(get_weight(0), device_type_, base::DataType::kDataTypeInt8,
                                    dim0_, dim1_);
@@ -62,7 +69,11 @@ base::Status MatmulLayer::forward() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK(cuda_config_ != nullptr);
   }
-  if (is_quant_layer_) {
+  if (is_quant_layer_ && quant_bits_ == 4) {
+    kernel::get_matmul_kernel_quant4(device_type_)(get_input(0), get_weight(0), get_output(0),
+                                                   group_size_, scales_, dim0_, dim1_,
+                                                   cuda_config_ ? cuda_config_.get() : nullptr);
+  } else if (is_quant_layer_) {
     kernel::get_matmul_kernel_quant8(device_type_)(get_input(0), get_weight(0), get_output(0),
                                                    group_size_, scales_,
                                                    cuda_config_ ? cuda_config_.get() : nullptr);
@@ -137,5 +148,10 @@ void MatmulLayer::to_cuda() {
     }
   }
 }
+
+void MatmulLayer::set_dim0(int32_t dim0) { dim0_ = dim0; }
+void MatmulLayer::set_dim1(int32_t dim1) { dim1_ = dim1; }
+int32_t MatmulLayer::get_dim0() const { return dim0_; }
+int32_t MatmulLayer::get_dim1() const { return dim1_; }
 
 }  // namespace op

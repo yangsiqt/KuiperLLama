@@ -178,10 +178,17 @@ class LayerParam : public Layer {
 
   void set_group_size(int32_t group_size);
 
+  void set_quant_bits(int32_t quant_bits);
+
+  int32_t get_quant_bits() const;
+
   int32_t get_scale_num() const;
+
+  int32_t get_weight_byte_size() const;
 
  protected:
   int32_t group_size_ = 0;
+  int32_t quant_bits_ = 8;
   bool is_quant_layer_ = false;
   tensor::Tensor scales_;
   std::vector<tensor::Tensor> weights_;

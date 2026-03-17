@@ -102,9 +102,11 @@ void Qwen3Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
 }
 
 Qwen3Model::Qwen3Model(base::TokenizerType tokenizer_type, std::string token_path,
-                       std::string model_path, bool is_quant_model)
+                       std::string model_path, bool is_quant_model, int32_t quant_bits)
     : Model(tokenizer_type, base::ModelType::kModelTypeLLama2, std::move(token_path),
-            std::move(model_path), is_quant_model) {}
+            std::move(model_path), is_quant_model) {
+  quant_bits_ = quant_bits;
+}
 
 base::Status Qwen3Model::init(base::DeviceType device_type) {
   using namespace base;
@@ -112,7 +114,7 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
     return error::PathNotValid(token_path_);
   }
   if (device_type == base::DeviceType::kDeviceCPU && is_quant_model_) {
-    return error::InternalError("The cpu device do not support int8 quant model.");
+    return error::InternalError("The cpu device does not support quantized models.");
   }
 
   device_type_ = device_type;
@@ -181,7 +183,132 @@ void Qwen3Model::create_nonparam_layers() {
       std::make_shared<op::SwiGLULayer>(device_type_, config_->immediate_dim_);
 }
 
-void Qwen3Model::create_param_quant_layers() {}
+void Qwen3Model::create_param_quant_layers() {
+  CHECK(is_quant_model_);
+  CHECK(qwen_layers_ != nullptr);
+
+  size_t pos = 0;
+  int32_t dim = config_->dim_;
+  int32_t kv_dim = config_->kv_dim_;
+  int32_t hidden_dim = config_->hidden_dim_;
+  int32_t immediate_dim = config_->immediate_dim_;
+  auto cpu_device_type = base::DeviceType::kDeviceCPU;
+
+  auto make_quant_matmul = [&](int32_t d0, int32_t d1) {
+    auto layer = std::make_shared<op::MatmulLayer>(device_type_, d0, d1, true);
+    layer->set_group_size(group_size_);
+    layer->set_quant_bits(quant_bits_);
+    return layer;
+  };
+
+  auto quant_weight_bytes = [&](int32_t d0, int32_t d1, int32_t scale_num) -> size_t {
+    if (quant_bits_ == 4) {
+      return static_cast<size_t>(d0) * d1 / 2 + scale_num * sizeof(float);
+    }
+    return static_cast<size_t>(d0) * d1 + scale_num * sizeof(float);
+  };
+
+  // WQ
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto wq = make_quant_matmul(dim, hidden_dim);
+    wq->set_weight(0, {dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    qwen_layers_->wq_layers_.push_back(wq);
+    pos += quant_weight_bytes(dim, hidden_dim, wq->get_scale_num());
+  }
+
+  // WK
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto wk = make_quant_matmul(kv_dim, hidden_dim);
+    wk->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    qwen_layers_->wk_layers_.push_back(wk);
+    pos += quant_weight_bytes(kv_dim, hidden_dim, wk->get_scale_num());
+  }
+
+  // WV
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto wv = make_quant_matmul(kv_dim, hidden_dim);
+    wv->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    qwen_layers_->wv_layers_.push_back(wv);
+    pos += quant_weight_bytes(kv_dim, hidden_dim, wv->get_scale_num());
+  }
+
+  // WO
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto wo = make_quant_matmul(hidden_dim, dim);
+    wo->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    qwen_layers_->wo_layers_.push_back(wo);
+    pos += quant_weight_bytes(hidden_dim, dim, wo->get_scale_num());
+  }
+
+  // W1 (gate_proj)
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto w1 = make_quant_matmul(immediate_dim, hidden_dim);
+    w1->set_weight(0, {immediate_dim, hidden_dim}, this->raw_model_data_->weight(pos),
+                   cpu_device_type);
+    qwen_layers_->w1_layers_.push_back(w1);
+    pos += quant_weight_bytes(immediate_dim, hidden_dim, w1->get_scale_num());
+  }
+
+  // W2 (down_proj)
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto w2 = make_quant_matmul(hidden_dim, immediate_dim);
+    w2->set_weight(0, {hidden_dim, immediate_dim}, this->raw_model_data_->weight(pos),
+                   cpu_device_type);
+    qwen_layers_->w2_layers_.push_back(w2);
+    pos += quant_weight_bytes(hidden_dim, immediate_dim, w2->get_scale_num());
+  }
+
+  // W3 (up_proj)
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto w3 = make_quant_matmul(immediate_dim, hidden_dim);
+    w3->set_weight(0, {immediate_dim, hidden_dim}, this->raw_model_data_->weight(pos),
+                   cpu_device_type);
+    qwen_layers_->w3_layers_.push_back(w3);
+    pos += quant_weight_bytes(immediate_dim, hidden_dim, w3->get_scale_num());
+  }
+
+  // CLS (lm_head)
+  auto cls_layer = make_quant_matmul(config_->vocab_size_, hidden_dim);
+  cls_layer->set_weight(0, {config_->vocab_size_, hidden_dim}, this->raw_model_data_->weight(pos),
+                        cpu_device_type);
+  pos += quant_weight_bytes(config_->vocab_size_, hidden_dim, cls_layer->get_scale_num());
+  qwen_layers_->cls_layer_ = cls_layer;
+
+  // === FP32 section (not quantized) ===
+  float* weight_ptr = reinterpret_cast<float*>(
+      static_cast<int8_t*>(raw_model_data_->weight_data) + pos);
+
+  // Embedding
+  qwen_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
+      device_type_, hidden_dim, config_->seq_len_, std::abs(config_->vocab_size_));
+  qwen_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), hidden_dim},
+                                             weight_ptr, cpu_device_type);
+  weight_ptr += config_->vocab_size_ * hidden_dim;
+
+  // RMSNorm (attention, ffn, final): 2*L+1
+  for (int32_t i = 0; i < 2 * config_->layer_num_ + 1; ++i) {
+    auto rms = std::make_shared<op::RmsNormLayer>(device_type_, hidden_dim);
+    rms->set_weight(0, {hidden_dim}, weight_ptr, cpu_device_type);
+    qwen_layers_->rmsnorm_layers_.push_back(rms);
+    weight_ptr += hidden_dim;
+  }
+
+  // Q norm
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto rms = std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
+    rms->set_weight(0, {config_->head_size_}, weight_ptr, cpu_device_type);
+    qwen_layers_->rmsnorm_layers_.push_back(rms);
+    weight_ptr += config_->head_size_;
+  }
+
+  // K norm
+  for (int32_t i = 0; i < config_->layer_num_; ++i) {
+    auto rms = std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
+    rms->set_weight(0, {config_->head_size_}, weight_ptr, cpu_device_type);
+    qwen_layers_->rmsnorm_layers_.push_back(rms);
+    weight_ptr += config_->head_size_;
+  }
+}
 
 void Qwen3Model::create_param_layers() {
   CHECK(qwen_layers_ != nullptr);
@@ -231,10 +358,10 @@ void Qwen3Model::create_param_layers() {
 
   // key
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wk = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, kv_dim, false);
-    wk->set_weight(0, {hidden_dim, kv_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wk = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim, false);
+    wk->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
     qwen_layers_->wk_layers_.push_back(wk);
-    pos = pos + hidden_dim * kv_dim;
+    pos = pos + kv_dim * hidden_dim;
   }
 
   // key norm
@@ -249,8 +376,8 @@ void Qwen3Model::create_param_layers() {
 
   // value
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wv = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, kv_dim, false);
-    wv->set_weight(0, {hidden_dim, kv_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    auto wv = std::make_shared<op::MatmulLayer>(device_type_, kv_dim, hidden_dim, false);
+    wv->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
     qwen_layers_->wv_layers_.push_back(wv);
     pos += kv_dim * hidden_dim;
   }
@@ -388,7 +515,7 @@ base::Status Qwen3Model::create_layers() {
   if (!is_quant_model_) {
     create_param_layers();
   } else {
-    return error::FunctionNotImplement("");
+    create_param_quant_layers();
   }
   create_nonparam_layers();
 

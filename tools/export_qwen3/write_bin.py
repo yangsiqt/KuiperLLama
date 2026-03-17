@@ -19,19 +19,21 @@ def serialize_fp32(file, tensor):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run Qwen3 in interactive mode.")
-    parser.add_argument("-m", "--max_length", type=int, default=128, help="Maximum length of the generated output.")
-    parser.add_argument("-t", "--deep_think", action='store_true', help="Enable thinking mode")
-    parser.add_argument("-p", "--checkpoint", type=str, default="/mnt/c/Users/hello/qwen3_0.6b_weights.pth",
-                        help="Model checkpoint file path.")
-    parser.add_argument("-d", "--device", type=str, default="cpu", help="Running model on which device")
-    parser.add_argument("-n", "--model_name", type=str, default="/home/fss/qwen3", help="Which official model to use")
+    parser = argparse.ArgumentParser(description="Export Qwen3 .pth to .bin for C++ inference.")
+    parser.add_argument("-p", "--checkpoint", type=str, default="qwen3_8b_weights.pth",
+                        help="Input .pth checkpoint file path")
+    parser.add_argument("-o", "--output", type=str, default="Qwen3-8B.bin",
+                        help="Output .bin file path for C++ inference")
+    parser.add_argument("-n", "--model_name", type=str, default="/home/dzy/models/Qwen3-8B",
+                        help="Model directory (for tokenizer & config.json)")
+    parser.add_argument("-d", "--device", type=str, default="cpu", help="Device for loading (cpu/cuda)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    model, tokenizer = model_load(model_name=args.model_name, device=args.device, checkpoint=args.checkpoint)
+    device = torch.device(args.device)
+    model, tokenizer = model_load(model_name=args.model_name, device=device, checkpoint=args.checkpoint)
     model.eval()
     weights = [
         # 2 * rmsnorm + 1
@@ -65,8 +67,7 @@ def main():
     max_seq_len = model.config.max_position_embeddings
 
     ## export
-    version = 1
-    file_path = "qwen0.6.bin"
+    file_path = args.output
     out_file = open(file_path, 'wb')
 
     header = struct.pack('iiiiiiii', dim, hidden_dim, n_layers, n_heads,
@@ -77,7 +78,8 @@ def main():
         serialize_fp32(out_file, w)
 
     out_file.close()
-    print(f"wrote {file_path}")
+    print(f"✅ Exported to {file_path}")
+    print(f"   Run: ./build/demo/qwen3_infer {file_path} {args.model_name}/tokenizer.json")
 
 
 if __name__ == "__main__":

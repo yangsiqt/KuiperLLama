@@ -48,7 +48,7 @@ struct Qwen3Layers {
 class Qwen3Model : public Model {
  public:
   explicit Qwen3Model(base::TokenizerType tokenizer_type, std::string token_path,
-                      std::string model_path, bool is_quant_model);
+                      std::string model_path, bool is_quant_model, int32_t quant_bits = 8);
 
   base::Status init(base::DeviceType device_type) override;
 

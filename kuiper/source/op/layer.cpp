@@ -199,8 +199,29 @@ base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dim
     weight.set_device_type(device_type);
     CHECK(weight.assign(buffer));
     weights_.at(idx) = weight;
+  } else if (quant_bits_ == 4) {
+    int32_t logical_size = 1;
+    for (auto d : dims) logical_size *= d;
+    int32_t packed_bytes = logical_size / 2;
+    int32_t scale_nums = logical_size / group_size_;
+
+    size_t total_bytes = packed_bytes + scale_nums * sizeof(float);
+    std::shared_ptr<base::Buffer> int4_buffer =
+        std::make_shared<base::Buffer>(total_bytes, nullptr, const_cast<void*>(weight_ptr), true);
+    if (device_type != base::DeviceType::kDeviceUnknown) {
+      int4_buffer->set_device_type(device_type);
+    }
+
+    std::vector<int32_t> packed_dims = {dims[0], dims[1] / 2};
+    tensor::Tensor weight(base::DataType::kDataTypeInt8, packed_dims);
+    weight.set_device_type(device_type);
+    CHECK(weight.assign(int4_buffer));
+    weights_.at(idx) = weight;
+
+    scales_ = tensor::Tensor{base::DataType::kDataTypeFp32, scale_nums, false, nullptr,
+                             reinterpret_cast<float*>((uint8_t*)weight_ptr + packed_bytes)};
+    scales_.set_device_type(device_type);
   } else {
-    // is quant layer
     tensor::Tensor weight(base::DataType::kDataTypeInt8, dims);
     weight.set_device_type(device_type);
     CHECK(weight.assign(buffer));
@@ -225,9 +246,21 @@ void LayerParam::set_scales(const tensor::Tensor& scales) {
 
 void LayerParam::set_group_size(int32_t group_size) { this->group_size_ = group_size; }
 
+void LayerParam::set_quant_bits(int32_t quant_bits) { this->quant_bits_ = quant_bits; }
+
+int32_t LayerParam::get_quant_bits() const { return quant_bits_; }
+
 int32_t LayerParam::get_scale_num() const {
   CHECK(!scales_.is_empty());
   return static_cast<int32_t>(scales_.size());
+}
+
+int32_t LayerParam::get_weight_byte_size() const {
+  CHECK(!weights_.empty() && !weights_.at(0).is_empty());
+  if (!is_quant_layer_) {
+    return static_cast<int32_t>(weights_.at(0).size() * sizeof(float));
+  }
+  return static_cast<int32_t>(weights_.at(0).byte_size());
 }
 
 void LayerParam::reset_weight_size(size_t size) { weights_.resize(size); }

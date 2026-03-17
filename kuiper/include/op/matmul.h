@@ -25,6 +25,11 @@ class MatmulLayer : public LayerParam {
 
   void to_cuda() override;
 
+  void set_dim0(int32_t dim0);
+  void set_dim1(int32_t dim1);
+  int32_t get_dim0() const;
+  int32_t get_dim1() const;
+
  private:
   int32_t dim0_ = 0;
   int32_t dim1_ = 0;

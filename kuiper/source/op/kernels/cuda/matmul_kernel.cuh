@@ -10,6 +10,11 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
 void matmul_kernel_cu_qint8(const tensor::Tensor& input, const tensor::Tensor& weight,
                             const tensor::Tensor& output, int32_t group_size,
                             const tensor::Tensor& scale, const CudaConfig* config = nullptr);
+
+void matmul_kernel_cu_qint4(const tensor::Tensor& input, const tensor::Tensor& weight,
+                            const tensor::Tensor& output, int32_t group_size,
+                            const tensor::Tensor& scale, int32_t dim0, int32_t dim1,
+                            const CudaConfig* config = nullptr);
 }  // namespace kernel
 
 #endif  // MATMUL_KERNEL_CU_CUH

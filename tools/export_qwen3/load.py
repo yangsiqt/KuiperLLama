@@ -10,7 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 from transformers import AutoTokenizer
 
-from config import Qwen3Config
+from config import Qwen3Config, load_config_from_json
 from model import Qwen3ForCausalLM
 
 def check_device_availability(device: torch.device):
@@ -58,13 +58,17 @@ def model_load(
     model_name: str,
     device: torch.device,
     checkpoint: str,
+    config=None,
 ):  
     if not check_device_availability(device):
         print(f"Specified device ({device}) is not available. Switching to CPU.")
         device = torch.device("cpu")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    config = Qwen3Config()
+    if config is None:
+        config = load_config_from_json(model_name)
+        print(f"Loaded config from {model_name}/config.json: "
+              f"hidden_size={config.hidden_size}, layers={config.num_hidden_layers}")
     model = Qwen3ForCausalLM(config=config).to(device=device, dtype=config.torch_type)
     print("Start loading model weight......")
     model = weight_load(model=model, checkpoint_path=checkpoint, device=device)
@@ -79,10 +83,10 @@ if __name__ == "__main__":
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     parser = argparse.ArgumentParser(description="Export Qwen3 model weights to .pth file")
-    parser.add_argument("--model_name", type=str, default="/home/fss/qwen3",
-                       help="HuggingFace model name or path (default: Qwen/Qwen3-0.6B)")
-    parser.add_argument("--output_file", type=str, default="/mnt/c/Users/hello/qwen3_0.6b_weights.pth",
-                       help="Output .pth file path (default: qwen3_0.6b_weights.pth)")
+    parser.add_argument("--model_name", type=str, default="/home/dzy/models/Qwen3-8B",
+                       help="HuggingFace model path (e.g. /home/dzy/models/Qwen3-8B)")
+    parser.add_argument("--output_file", type=str, default="qwen3_8b_weights.pth",
+                       help="Output .pth file path")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
