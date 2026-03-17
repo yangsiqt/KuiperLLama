@@ -66,6 +66,13 @@ base::Status Model::read_model_file() {
           "Failed to retrieve the group size information from the model "
           "file.");
     }
+    if (has_awq_) {
+      int32_t awq_flag = 0;
+      if (fread(&awq_flag, sizeof(int32_t), 1, file) != 1 || awq_flag != 1) {
+        return error::ModelParseError(
+            "Failed to read AWQ flag from the model file.");
+      }
+    }
   }
 
   auto gen_status = generate_model_infos(config);
@@ -99,8 +106,12 @@ base::Status Model::read_model_file() {
     raw_model_data_->weight_data =
         static_cast<int8_t*>(raw_model_data_->data) + sizeof(ModelConfig);
   } else {
+    size_t header_extra = sizeof(group_size_);
+    if (has_awq_) {
+      header_extra += sizeof(int32_t);
+    }
     raw_model_data_->weight_data =
-        static_cast<int8_t*>(raw_model_data_->data) + sizeof(ModelConfig) + sizeof(group_size_);
+        static_cast<int8_t*>(raw_model_data_->data) + sizeof(ModelConfig) + header_extra;
   }
   if (raw_model_data_ == nullptr) {
     LOG(ERROR);

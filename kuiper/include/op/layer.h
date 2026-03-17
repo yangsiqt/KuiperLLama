@@ -186,11 +186,18 @@ class LayerParam : public Layer {
 
   int32_t get_weight_byte_size() const;
 
+  void set_awq_scales(const tensor::Tensor& awq_scales);
+
+  const tensor::Tensor& get_awq_scales() const;
+
+  bool has_awq() const;
+
  protected:
   int32_t group_size_ = 0;
   int32_t quant_bits_ = 8;
   bool is_quant_layer_ = false;
   tensor::Tensor scales_;
+  tensor::Tensor awq_scales_;
   std::vector<tensor::Tensor> weights_;
 };
 }  // namespace op

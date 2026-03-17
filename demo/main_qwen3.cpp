@@ -59,21 +59,26 @@ std::string fill_template(const std::string& content) {
 }
 
 int main(int argc, char* argv[]) {
-  if (argc < 3 || argc > 4) {
-    LOG(INFO) << "Usage: ./qwen3_infer checkpoint_path tokenizer_path [quant_bits]";
+  if (argc < 3 || argc > 5) {
+    LOG(INFO) << "Usage: ./qwen3_infer checkpoint_path tokenizer_path [quant_bits] [awq]";
     LOG(INFO) << "  quant_bits: 0=FP32(default), 8=INT8, 4=INT4";
+    LOG(INFO) << "  awq: 1=AWQ enabled (default: 0)";
     return -1;
   }
   const char* checkpoint_path = argv[1];
   const char* tokenizer_path = argv[2];
   int quant_bits = 0;
-  if (argc == 4) {
+  if (argc >= 4) {
     quant_bits = std::atoi(argv[3]);
+  }
+  bool has_awq = false;
+  if (argc >= 5) {
+    has_awq = (std::atoi(argv[4]) == 1);
   }
 
   bool is_quant = (quant_bits == 4 || quant_bits == 8);
   model::Qwen3Model model(base::TokenizerType::kEncodeBpe, tokenizer_path, checkpoint_path,
-                           is_quant, quant_bits);
+                           is_quant, quant_bits, has_awq);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();

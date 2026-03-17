@@ -179,6 +179,9 @@ void LayerParam::to_cuda() {
   if (!scales_.is_empty()) {
     scales_.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
   }
+  if (!awq_scales_.is_empty()) {
+    awq_scales_.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+  }
 }
 
 base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dims,
@@ -247,6 +250,14 @@ void LayerParam::set_scales(const tensor::Tensor& scales) {
 void LayerParam::set_group_size(int32_t group_size) { this->group_size_ = group_size; }
 
 void LayerParam::set_quant_bits(int32_t quant_bits) { this->quant_bits_ = quant_bits; }
+
+void LayerParam::set_awq_scales(const tensor::Tensor& awq_scales) {
+  this->awq_scales_ = awq_scales;
+}
+
+const tensor::Tensor& LayerParam::get_awq_scales() const { return awq_scales_; }
+
+bool LayerParam::has_awq() const { return !awq_scales_.is_empty(); }
 
 int32_t LayerParam::get_quant_bits() const { return quant_bits_; }
 

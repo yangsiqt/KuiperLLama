@@ -82,6 +82,7 @@ class Model {
   int32_t group_size_ = 1;
   int32_t quant_bits_ = 8;
   bool is_quant_model_ = false;
+  bool has_awq_ = false;
   std::unique_ptr<TransformerConfig> config_;
 
   std::string token_path_;

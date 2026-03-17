@@ -110,7 +110,8 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
 
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
 __global__ void matmul_kernel_cu_fp32int4(const float* input, const uint8_t* weight,
-                                          const float* scales, const int32_t group_size,
+                                          const float* scales, const float* awq_scales,
+                                          const int32_t group_size,
                                           float* output, int M, int K) {
   __shared__ float sdata[THREAD_PER_BLOCK];
   unsigned int tid = threadIdx.x;
@@ -134,8 +135,16 @@ __global__ void matmul_kernel_cu_fp32int4(const float* input, const uint8_t* wei
 
       const int logical_lo = p * M + elem_lo;
       const int logical_hi = p * M + elem_hi;
-      sdata[tid] += input[elem_lo] * scales[logical_lo / group_size] * static_cast<float>(val_lo);
-      sdata[tid] += input[elem_hi] * scales[logical_hi / group_size] * static_cast<float>(val_hi);
+
+      float in_lo = input[elem_lo];
+      float in_hi = input[elem_hi];
+      if (awq_scales) {
+        in_lo *= awq_scales[elem_lo];
+        in_hi *= awq_scales[elem_hi];
+      }
+
+      sdata[tid] += in_lo * scales[logical_lo / group_size] * static_cast<float>(val_lo);
+      sdata[tid] += in_hi * scales[logical_hi / group_size] * static_cast<float>(val_hi);
     }
     __syncthreads();
 
@@ -153,7 +162,8 @@ __global__ void matmul_kernel_cu_fp32int4(const float* input, const uint8_t* wei
 
 void matmul_kernel_cu_qint4(const tensor::Tensor& input, const tensor::Tensor& weight,
                             const tensor::Tensor& output, int32_t group_size,
-                            const tensor::Tensor& scale, int32_t dim0, int32_t dim1,
+                            const tensor::Tensor& scale, const tensor::Tensor& awq_scale,
+                            int32_t dim0, int32_t dim1,
                             const CudaConfig* config) {
   CHECK(config != nullptr);
   CHECK(input.is_empty() == false && input.dims_size() <= 2);
@@ -165,13 +175,16 @@ void matmul_kernel_cu_qint4(const tensor::Tensor& input, const tensor::Tensor& w
   const int32_t M = dim1;
   CHECK_EQ(M % 2, 0);
   CHECK_EQ(M, input.get_dim(0));
+
+  const float* awq_ptr = awq_scale.is_empty() ? nullptr : awq_scale.ptr<float>();
+
   if (config->stream) {
     matmul_kernel_cu_fp32int4<128, 1><<<K, 128, 0, config->stream>>>(
-        input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), group_size,
+        input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), awq_ptr, group_size,
         const_cast<float*>(output.ptr<float>()), M, K);
   } else {
     matmul_kernel_cu_fp32int4<128, 1><<<K, 128>>>(
-        input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), group_size,
+        input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), awq_ptr, group_size,
         const_cast<float*>(output.ptr<float>()), M, K);
   }
 }

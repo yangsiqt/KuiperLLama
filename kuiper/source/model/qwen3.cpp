@@ -102,10 +102,12 @@ void Qwen3Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
 }
 
 Qwen3Model::Qwen3Model(base::TokenizerType tokenizer_type, std::string token_path,
-                       std::string model_path, bool is_quant_model, int32_t quant_bits)
+                       std::string model_path, bool is_quant_model, int32_t quant_bits,
+                       bool has_awq)
     : Model(tokenizer_type, base::ModelType::kModelTypeLLama2, std::move(token_path),
             std::move(model_path), is_quant_model) {
   quant_bits_ = quant_bits;
+  has_awq_ = has_awq;
 }
 
 base::Status Qwen3Model::init(base::DeviceType device_type) {
@@ -202,16 +204,42 @@ void Qwen3Model::create_param_quant_layers() {
   };
 
   auto quant_weight_bytes = [&](int32_t d0, int32_t d1, int32_t scale_num) -> size_t {
+    size_t bytes;
     if (quant_bits_ == 4) {
-      return static_cast<size_t>(d0) * d1 / 2 + scale_num * sizeof(float);
+      bytes = static_cast<size_t>(d0) * d1 / 2 + scale_num * sizeof(float);
+    } else {
+      bytes = static_cast<size_t>(d0) * d1 + scale_num * sizeof(float);
     }
-    return static_cast<size_t>(d0) * d1 + scale_num * sizeof(float);
+    if (has_awq_) {
+      bytes += static_cast<size_t>(d1) * sizeof(float);
+    }
+    return bytes;
+  };
+
+  auto load_awq_scales = [&](std::shared_ptr<op::MatmulLayer>& layer,
+                             int32_t d0, int32_t d1, size_t weight_pos) {
+    if (!has_awq_) return;
+    size_t awq_offset = weight_pos;
+    if (quant_bits_ == 4) {
+      awq_offset += static_cast<size_t>(d0) * d1 / 2;
+    } else {
+      awq_offset += static_cast<size_t>(d0) * d1;
+    }
+    int32_t scale_num = d0 * d1 / group_size_;
+    awq_offset += scale_num * sizeof(float);
+
+    float* awq_ptr = reinterpret_cast<float*>(
+        static_cast<int8_t*>(raw_model_data_->weight_data) + awq_offset);
+    tensor::Tensor awq_scales(base::DataType::kDataTypeFp32, d1, false, nullptr, awq_ptr);
+    awq_scales.set_device_type(cpu_device_type);
+    layer->set_awq_scales(awq_scales);
   };
 
   // WQ
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wq = make_quant_matmul(dim, hidden_dim);
     wq->set_weight(0, {dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    load_awq_scales(wq, dim, hidden_dim, pos);
     qwen_layers_->wq_layers_.push_back(wq);
     pos += quant_weight_bytes(dim, hidden_dim, wq->get_scale_num());
   }
@@ -220,6 +248,7 @@ void Qwen3Model::create_param_quant_layers() {
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wk = make_quant_matmul(kv_dim, hidden_dim);
     wk->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    load_awq_scales(wk, kv_dim, hidden_dim, pos);
     qwen_layers_->wk_layers_.push_back(wk);
     pos += quant_weight_bytes(kv_dim, hidden_dim, wk->get_scale_num());
   }
@@ -228,6 +257,7 @@ void Qwen3Model::create_param_quant_layers() {
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wv = make_quant_matmul(kv_dim, hidden_dim);
     wv->set_weight(0, {kv_dim, hidden_dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    load_awq_scales(wv, kv_dim, hidden_dim, pos);
     qwen_layers_->wv_layers_.push_back(wv);
     pos += quant_weight_bytes(kv_dim, hidden_dim, wv->get_scale_num());
   }
@@ -236,6 +266,7 @@ void Qwen3Model::create_param_quant_layers() {
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wo = make_quant_matmul(hidden_dim, dim);
     wo->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    load_awq_scales(wo, hidden_dim, dim, pos);
     qwen_layers_->wo_layers_.push_back(wo);
     pos += quant_weight_bytes(hidden_dim, dim, wo->get_scale_num());
   }
@@ -245,6 +276,7 @@ void Qwen3Model::create_param_quant_layers() {
     auto w1 = make_quant_matmul(immediate_dim, hidden_dim);
     w1->set_weight(0, {immediate_dim, hidden_dim}, this->raw_model_data_->weight(pos),
                    cpu_device_type);
+    load_awq_scales(w1, immediate_dim, hidden_dim, pos);
     qwen_layers_->w1_layers_.push_back(w1);
     pos += quant_weight_bytes(immediate_dim, hidden_dim, w1->get_scale_num());
   }
@@ -254,6 +286,7 @@ void Qwen3Model::create_param_quant_layers() {
     auto w2 = make_quant_matmul(hidden_dim, immediate_dim);
     w2->set_weight(0, {hidden_dim, immediate_dim}, this->raw_model_data_->weight(pos),
                    cpu_device_type);
+    load_awq_scales(w2, hidden_dim, immediate_dim, pos);
     qwen_layers_->w2_layers_.push_back(w2);
     pos += quant_weight_bytes(hidden_dim, immediate_dim, w2->get_scale_num());
   }
@@ -263,6 +296,7 @@ void Qwen3Model::create_param_quant_layers() {
     auto w3 = make_quant_matmul(immediate_dim, hidden_dim);
     w3->set_weight(0, {immediate_dim, hidden_dim}, this->raw_model_data_->weight(pos),
                    cpu_device_type);
+    load_awq_scales(w3, immediate_dim, hidden_dim, pos);
     qwen_layers_->w3_layers_.push_back(w3);
     pos += quant_weight_bytes(immediate_dim, hidden_dim, w3->get_scale_num());
   }
@@ -271,6 +305,7 @@ void Qwen3Model::create_param_quant_layers() {
   auto cls_layer = make_quant_matmul(config_->vocab_size_, hidden_dim);
   cls_layer->set_weight(0, {config_->vocab_size_, hidden_dim}, this->raw_model_data_->weight(pos),
                         cpu_device_type);
+  load_awq_scales(cls_layer, config_->vocab_size_, hidden_dim, pos);
   pos += quant_weight_bytes(config_->vocab_size_, hidden_dim, cls_layer->get_scale_num());
   qwen_layers_->cls_layer_ = cls_layer;
 

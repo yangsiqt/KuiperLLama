@@ -71,7 +71,8 @@ base::Status MatmulLayer::forward() {
   }
   if (is_quant_layer_ && quant_bits_ == 4) {
     kernel::get_matmul_kernel_quant4(device_type_)(get_input(0), get_weight(0), get_output(0),
-                                                   group_size_, scales_, dim0_, dim1_,
+                                                   group_size_, scales_, awq_scales_,
+                                                   dim0_, dim1_,
                                                    cuda_config_ ? cuda_config_.get() : nullptr);
   } else if (is_quant_layer_) {
     kernel::get_matmul_kernel_quant8(device_type_)(get_input(0), get_weight(0), get_output(0),

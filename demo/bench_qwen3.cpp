@@ -282,12 +282,13 @@ int main(int argc, char* argv[]) {
   if (argc < 3) {
     printf(
         "Usage: %s <checkpoint> <tokenizer> [max_tokens] [bench_runs] [quant_bits] "
-        "[prompt_tokens]\n",
+        "[prompt_tokens] [awq]\n",
         argv[0]);
     printf("  max_tokens    : max tokens to generate (default: 512)\n");
     printf("  bench_runs    : number of benchmark iterations (default: 10)\n");
     printf("  quant_bits    : 0=FP32, 4=INT4, 8=INT8 (default: 0)\n");
     printf("  prompt_tokens : target prompt length in tokens (default: 0=use built-in)\n");
+    printf("  awq           : 1=AWQ enabled (default: 0)\n");
     return 1;
   }
 
@@ -300,6 +301,8 @@ int main(int argc, char* argv[]) {
   if (argc >= 6) quant_bits = std::atoi(argv[5]);
   int target_prompt_tokens = 0;
   if (argc >= 7) target_prompt_tokens = std::atoi(argv[6]);
+  bool has_awq = false;
+  if (argc >= 8) has_awq = (std::atoi(argv[7]) == 1);
 
 #ifdef USE_NAIVE_MHA
   const char* mha_tag = "naive";
@@ -308,6 +311,7 @@ int main(int argc, char* argv[]) {
 #endif
 
   std::string quant_tag = quant_bits > 0 ? std::string("int") + std::to_string(quant_bits) : "fp32";
+  if (has_awq) quant_tag += "_awq";
   std::string full_tag = std::string(mha_tag) + "_" + quant_tag;
 
   std::string log_path = create_log_file("/home/dzy/KuiperLLama", full_tag.c_str(),
@@ -318,9 +322,9 @@ int main(int argc, char* argv[]) {
   }
 
   bool is_quant = (quant_bits == 4 || quant_bits == 8);
-  tee_printf("Loading model (quant_bits=%d)...\n", quant_bits);
+  tee_printf("Loading model (quant_bits=%d, awq=%d)...\n", quant_bits, has_awq ? 1 : 0);
   model::Qwen3Model model(base::TokenizerType::kEncodeBpe, config.tokenizer_path,
-                           config.checkpoint_path, is_quant, quant_bits);
+                           config.checkpoint_path, is_quant, quant_bits, has_awq);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "Model init failed: " << init_status.get_err_code();
