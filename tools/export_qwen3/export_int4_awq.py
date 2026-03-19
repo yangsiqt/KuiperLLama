@@ -165,21 +165,42 @@ def grid_search_alpha(w, act_samples, act_scale, group_size, alphas=None):
     return best_alpha, best_scale, best_error, baseline_err
 
 
-def collect_activation_scales(model, tokenizer, device, n_samples=8):
+def _load_wikitext2_calibration(n_samples=128, min_words=20):
+    """Load calibration texts from WikiText-2 dataset."""
+    from datasets import load_dataset
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    texts = [t for t in ds["text"] if t.strip() and len(t.split()) >= min_words]
+    if len(texts) > n_samples:
+        import random
+        random.seed(42)
+        texts = random.sample(texts, n_samples)
+    return texts
+
+
+_BUILTIN_CALIBRATION_TEXTS = [
+    "The history of artificial intelligence began in the 1950s when researchers first explored the concept of machine intelligence. The Dartmouth Conference of 1956 is widely considered the founding event of AI as a field.",
+    "Large language models like GPT and LLaMA use the transformer architecture with self-attention mechanisms to process and generate text. These models are trained on massive datasets.",
+    "人工智能是计算机科学的一个分支，致力于创建能够执行通常需要人类智能的任务的系统。深度学习是目前最流行的方法之一。",
+    "量化技术通过降低模型权重的数值精度来减少内存占用和计算开销。常见的方法包括INT8量化、INT4量化和混合精度推理。",
+    "Neural networks consist of layers of interconnected nodes that process information. Each connection has a weight that is adjusted during training to minimize the loss function.",
+    "The transformer architecture introduced in 2017 revolutionized natural language processing. Key innovations include multi-head self-attention and positional encoding.",
+    "推理引擎的性能优化包括算子融合、内存池管理、KV缓存优化、以及利用GPU的并行计算能力进行高效的矩阵乘法运算。",
+    "Modern GPU architectures like NVIDIA's Ampere and Hopper provide dedicated tensor cores that accelerate matrix multiplication operations commonly used in deep learning workloads.",
+]
+
+
+def collect_activation_scales(model, tokenizer, device, n_samples=8, calibration="builtin"):
     """
     Collect per-channel activation scales for each linear layer
     by running calibration data through the model.
+    calibration: "builtin" (8 hardcoded texts) or "wikitext2" (128 samples from WikiText-2)
     """
-    calibration_texts = [
-        "The history of artificial intelligence began in the 1950s when researchers first explored the concept of machine intelligence. The Dartmouth Conference of 1956 is widely considered the founding event of AI as a field.",
-        "Large language models like GPT and LLaMA use the transformer architecture with self-attention mechanisms to process and generate text. These models are trained on massive datasets.",
-        "人工智能是计算机科学的一个分支，致力于创建能够执行通常需要人类智能的任务的系统。深度学习是目前最流行的方法之一。",
-        "量化技术通过降低模型权重的数值精度来减少内存占用和计算开销。常见的方法包括INT8量化、INT4量化和混合精度推理。",
-        "Neural networks consist of layers of interconnected nodes that process information. Each connection has a weight that is adjusted during training to minimize the loss function.",
-        "The transformer architecture introduced in 2017 revolutionized natural language processing. Key innovations include multi-head self-attention and positional encoding.",
-        "推理引擎的性能优化包括算子融合、内存池管理、KV缓存优化、以及利用GPU的并行计算能力进行高效的矩阵乘法运算。",
-        "Modern GPU architectures like NVIDIA's Ampere and Hopper provide dedicated tensor cores that accelerate matrix multiplication operations commonly used in deep learning workloads.",
-    ]
+    if calibration == "wikitext2":
+        calibration_texts = _load_wikitext2_calibration(n_samples=128)
+        print(f"  Using WikiText-2 calibration: {len(calibration_texts)} samples")
+    else:
+        calibration_texts = _BUILTIN_CALIBRATION_TEXTS
+        print(f"  Using builtin calibration: {len(calibration_texts)} samples")
 
     act_scales = {}
     hooks = []
@@ -260,6 +281,9 @@ def main():
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--group_size", type=int, default=64)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--calibration", type=str, default="wikitext2",
+                        choices=["builtin", "wikitext2"],
+                        help="Calibration data: 'builtin' (8 hardcoded) or 'wikitext2' (128 samples)")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -297,7 +321,8 @@ def main():
 
     # === Step 2: Collect activation scales ===
     print("\n=== Step 2: Collecting activation scales ===")
-    act_scales, act_samples = collect_activation_scales(model, tokenizer, device)
+    act_scales, act_samples = collect_activation_scales(model, tokenizer, device,
+                                                         calibration=args.calibration)
     print(f"  Collected scales for {len(act_scales)} layers")
 
     # === Step 3: Grid search for optimal alpha per layer ===
