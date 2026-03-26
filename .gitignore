@@ -1,10 +1,10 @@
 # IDE
 .idea/
-# .vscode/
+.vscode/
 
 # Build
 build/
 lib/
 
 # Project notes
-# kuiperllama改造.md
+
