@@ -1,6 +1,6 @@
 # IDE
 .idea/
-# .vscode/
+.vscode/
 .cache/
 
 # Build
@@ -11,4 +11,4 @@ lib/
 logs/
 
 # Project notes
-# kuiperllama改造.md
+
