@@ -218,16 +218,22 @@ def collect_activation_scales(model, tokenizer, device, n_samples=8, calibration
         return hook_fn
 
     act_samples = {}
+    # Cap rows per layer during collection so WikiText-2 (128 texts) does not OOM RAM.
+    max_act_rows = 64
 
     def make_sample_hook(name):
         def hook_fn(module, input, output):
             x = input[0].detach().float()
             if x.dim() == 3:
                 x = x.reshape(-1, x.shape[-1])
+            x_cpu = x.cpu()
             if name in act_samples:
-                act_samples[name] = torch.cat([act_samples[name], x.cpu()], dim=0)
+                cur = act_samples[name]
+                if cur.shape[0] < max_act_rows:
+                    remain = max_act_rows - cur.shape[0]
+                    act_samples[name] = torch.cat([cur, x_cpu[:remain]], dim=0)
             else:
-                act_samples[name] = x.cpu()
+                act_samples[name] = x_cpu[:max_act_rows]
         return hook_fn
 
     for name, module in model.named_modules():
@@ -511,7 +517,7 @@ def main():
     print(f"\nExport complete: {output_path}")
     print(f"  File size: {file_size / 1024 / 1024:.1f} MB")
     print(f"\nRun inference:")
-    print(f"  ./build/demo/qwen3_infer {output_path} {model_dir}/tokenizer.json 4")
+    print(f"  ./build/demo/qwen3_infer {output_path} {model_dir}/tokenizer.json 4 1")
 
 
 if __name__ == "__main__":
