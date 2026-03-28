@@ -189,14 +189,21 @@ _BUILTIN_CALIBRATION_TEXTS = [
 ]
 
 
-def collect_activation_scales(model, tokenizer, device, n_samples=8, calibration="builtin"):
+def collect_activation_scales(
+    model,
+    tokenizer,
+    device,
+    n_samples=8,
+    calibration="builtin",
+    wikitext_n_samples=128,
+):
     """
     Collect per-channel activation scales for each linear layer
     by running calibration data through the model.
-    calibration: "builtin" (8 hardcoded texts) or "wikitext2" (128 samples from WikiText-2)
+    calibration: "builtin" (8 hardcoded texts) or "wikitext2" (默认 128 条，可用 wikitext_n_samples 减少)
     """
     if calibration == "wikitext2":
-        calibration_texts = _load_wikitext2_calibration(n_samples=128)
+        calibration_texts = _load_wikitext2_calibration(n_samples=wikitext_n_samples)
         print(f"  Using WikiText-2 calibration: {len(calibration_texts)} samples")
     else:
         calibration_texts = _BUILTIN_CALIBRATION_TEXTS

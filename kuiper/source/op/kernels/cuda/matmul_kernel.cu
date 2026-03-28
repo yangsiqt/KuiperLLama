@@ -108,11 +108,13 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   }
 }
 
+// INT4 Q4_0, FP32 activations — no AWQ (dedicated kernel, no inner branch).
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
-__global__ void matmul_kernel_cu_fp32int4(const float* input, const uint8_t* weight,
-                                          const float* scales, const float* awq_scales,
-                                          const int32_t group_size,
-                                          float* output, int M, int K) {
+__global__ void matmul_kernel_cu_fp32int4(const float* __restrict__ input,
+                                          const uint8_t* __restrict__ weight,
+                                          const float* __restrict__ scales,
+                                          const int32_t group_size, float* __restrict__ output,
+                                          int M, int K) {
   __shared__ float sdata[THREAD_PER_BLOCK];
   unsigned int tid = threadIdx.x;
 
@@ -135,16 +137,68 @@ __global__ void matmul_kernel_cu_fp32int4(const float* input, const uint8_t* wei
 
       const int logical_lo = p * M + elem_lo;
       const int logical_hi = p * M + elem_hi;
+      const int g_lo = logical_lo / group_size;
+      const int g_hi = logical_hi / group_size;
+      const float s_lo = scales[g_lo];
+      const float s_hi = (g_hi == g_lo) ? s_lo : scales[g_hi];
 
-      float in_lo = input[elem_lo];
-      float in_hi = input[elem_hi];
-      if (awq_scales) {
-        in_lo *= awq_scales[elem_lo];
-        in_hi *= awq_scales[elem_hi];
-      }
+      sdata[tid] += input[elem_lo] * s_lo * static_cast<float>(val_lo);
+      sdata[tid] += input[elem_hi] * s_hi * static_cast<float>(val_hi);
+    }
+    __syncthreads();
 
-      sdata[tid] += in_lo * scales[logical_lo / group_size] * static_cast<float>(val_lo);
-      sdata[tid] += in_hi * scales[logical_hi / group_size] * static_cast<float>(val_hi);
+    using BlockReduce = cub::BlockReduce<float, THREAD_PER_BLOCK>;
+    __shared__ typename BlockReduce::TempStorage temp;
+    float part_sum = BlockReduce(temp).Sum(sdata[tid]);
+    __syncthreads();
+
+    if (tid == 0) {
+      output[p] = part_sum;
+    }
+    __syncthreads();
+  }
+}
+
+// AWQ: fuse input * (1/s) per channel; separate kernel avoids branch + allows same scale CSE.
+template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
+__global__ void matmul_kernel_cu_fp32int4_awq(const float* __restrict__ input,
+                                              const uint8_t* __restrict__ weight,
+                                              const float* __restrict__ scales,
+                                              const float* __restrict__ awq_scales,
+                                              const int32_t group_size, float* __restrict__ output,
+                                              int M, int K) {
+  __shared__ float sdata[THREAD_PER_BLOCK];
+  unsigned int tid = threadIdx.x;
+
+  int start_row = blockIdx.x * ROW_PER_BLOCK;
+  int end_row = start_row + ROW_PER_BLOCK;
+  if (start_row >= K) {
+    return;
+  }
+  const int half_M = M / 2;
+  for (int p = start_row; p < end_row; ++p) {
+    sdata[tid] = 0;
+    for (int i = tid; i < half_M; i += THREAD_PER_BLOCK) {
+      const int byte_idx = p * half_M + i;
+      const uint8_t packed = weight[byte_idx];
+      const int elem_lo = i * 2;
+      const int elem_hi = i * 2 + 1;
+
+      const int8_t val_lo = static_cast<int8_t>((packed & 0x0F)) - 8;
+      const int8_t val_hi = static_cast<int8_t>((packed >> 4)) - 8;
+
+      const int logical_lo = p * M + elem_lo;
+      const int logical_hi = p * M + elem_hi;
+      const int g_lo = logical_lo / group_size;
+      const int g_hi = logical_hi / group_size;
+      const float s_lo = scales[g_lo];
+      const float s_hi = (g_hi == g_lo) ? s_lo : scales[g_hi];
+
+      const float in_lo = input[elem_lo] * awq_scales[elem_lo];
+      const float in_hi = input[elem_hi] * awq_scales[elem_hi];
+
+      sdata[tid] += in_lo * s_lo * static_cast<float>(val_lo);
+      sdata[tid] += in_hi * s_hi * static_cast<float>(val_hi);
     }
     __syncthreads();
 
@@ -176,16 +230,26 @@ void matmul_kernel_cu_qint4(const tensor::Tensor& input, const tensor::Tensor& w
   CHECK_EQ(M % 2, 0);
   CHECK_EQ(M, input.get_dim(0));
 
-  const float* awq_ptr = awq_scale.is_empty() ? nullptr : awq_scale.ptr<float>();
-
-  if (config->stream) {
-    matmul_kernel_cu_fp32int4<128, 1><<<K, 128, 0, config->stream>>>(
-        input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), awq_ptr, group_size,
-        const_cast<float*>(output.ptr<float>()), M, K);
+  if (awq_scale.is_empty()) {
+    if (config->stream) {
+      matmul_kernel_cu_fp32int4<128, 1><<<K, 128, 0, config->stream>>>(
+          input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), group_size,
+          const_cast<float*>(output.ptr<float>()), M, K);
+    } else {
+      matmul_kernel_cu_fp32int4<128, 1><<<K, 128>>>(
+          input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), group_size,
+          const_cast<float*>(output.ptr<float>()), M, K);
+    }
   } else {
-    matmul_kernel_cu_fp32int4<128, 1><<<K, 128>>>(
-        input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), awq_ptr, group_size,
-        const_cast<float*>(output.ptr<float>()), M, K);
+    if (config->stream) {
+      matmul_kernel_cu_fp32int4_awq<128, 1><<<K, 128, 0, config->stream>>>(
+          input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), awq_scale.ptr<float>(),
+          group_size, const_cast<float*>(output.ptr<float>()), M, K);
+    } else {
+      matmul_kernel_cu_fp32int4_awq<128, 1><<<K, 128>>>(
+          input.ptr<float>(), weight.ptr<uint8_t>(), scale.ptr<float>(), awq_scale.ptr<float>(),
+          group_size, const_cast<float*>(output.ptr<float>()), M, K);
+    }
   }
 }
 
