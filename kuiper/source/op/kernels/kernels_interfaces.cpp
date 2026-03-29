@@ -69,6 +69,15 @@ MatmulKernelQuant4 get_matmul_kernel_quant4(base::DeviceType device_type) {
   }
 }
 
+OutlierGemmKernel get_outlier_gemm_kernel(base::DeviceType device_type) {
+  if (device_type == base::DeviceType::kDeviceCUDA) {
+    return outlier_gemm_kernel_cu;
+  } else {
+    LOG(FATAL) << "Unknown device type for get an outlier gemm kernel.";
+    return nullptr;
+  }
+}
+
 MHAKernel get_mha_kernel(base::DeviceType device_type) {
   if (device_type == base::DeviceType::kDeviceCPU) {
     return mha_kernel;

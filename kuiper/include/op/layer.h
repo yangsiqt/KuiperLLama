@@ -192,12 +192,24 @@ class LayerParam : public Layer {
 
   bool has_awq() const;
 
+  void set_outlier(const tensor::Tensor& indices, const tensor::Tensor& weights);
+
+  bool has_outlier() const;
+
+  const tensor::Tensor& get_outlier_indices() const;
+
+  const tensor::Tensor& get_outlier_weights() const;
+
+  int32_t get_outlier_count() const;
+
  protected:
   int32_t group_size_ = 0;
   int32_t quant_bits_ = 8;
   bool is_quant_layer_ = false;
   tensor::Tensor scales_;
   tensor::Tensor awq_scales_;
+  tensor::Tensor outlier_indices_;
+  tensor::Tensor outlier_weights_;
   std::vector<tensor::Tensor> weights_;
 };
 }  // namespace op

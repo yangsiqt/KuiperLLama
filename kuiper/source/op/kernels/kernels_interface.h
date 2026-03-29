@@ -19,6 +19,13 @@ typedef void (*MatmulKernelQuant4)(const tensor::Tensor& input, const tensor::Te
                                    int32_t dim0, int32_t dim1,
                                    const CudaConfig* config);
 
+typedef void (*OutlierGemmKernel)(const tensor::Tensor& input,
+                                  const tensor::Tensor& outlier_weights,
+                                  const tensor::Tensor& outlier_indices,
+                                  const tensor::Tensor& output,
+                                  int32_t dim0, int32_t n_outlier,
+                                  const CudaConfig* config);
+
 typedef void (*EmbeddingKernel)(const tensor::Tensor& input, const tensor::Tensor& weight,
                                 const tensor::Tensor& output, int32_t vocab_size, void* stream);
 
@@ -63,6 +70,8 @@ MatmulKernel get_matmul_kernel(base::DeviceType device_type);
 MatmulKernelQuant get_matmul_kernel_quant8(base::DeviceType device_type);
 
 MatmulKernelQuant4 get_matmul_kernel_quant4(base::DeviceType device_type);
+
+OutlierGemmKernel get_outlier_gemm_kernel(base::DeviceType device_type);
 
 MHAKernel get_mha_kernel(base::DeviceType device_type);
 

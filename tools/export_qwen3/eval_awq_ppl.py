@@ -34,6 +34,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from export_int4_awq import (  # noqa: E402
     collect_activation_scales,
     grid_search_alpha,
+    auto_clip_search,
     load_safetensors,
 )
 
@@ -64,15 +65,100 @@ def awq_effective_weight(
     return w_dq * inv.unsqueeze(0)
 
 
+def awq_clip_effective_weight(
+    w: torch.Tensor, awq_scale: torch.Tensor, clip_max: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    """AWQ scaling + per-group clipping + Q4_0 round-trip."""
+    s = awq_scale.float().clamp(min=1e-10)
+    w_scaled = w.float() * s.unsqueeze(0)
+    flat = w_scaled.reshape(-1, group_size)
+    clip = clip_max.float().reshape(-1, 1)
+    flat = torch.clamp(flat, -clip, clip)
+    w_clipped = flat.reshape(w.shape)
+    w_dq = q40_roundtrip_dequant(w_clipped, group_size)
+    inv = 1.0 / s
+    return w_dq * inv.unsqueeze(0)
+
+
+def awq_clip_outlier_effective_weight(
+    w: torch.Tensor, awq_scale: torch.Tensor, clip_max: torch.Tensor,
+    act_scale: torch.Tensor, group_size: int, outlier_ratio: float,
+) -> torch.Tensor:
+    """AWQ scaling + per-group clipping + outlier FP32 protection."""
+    w = w.float()
+    out_features, in_features = w.shape
+    k = max(1, int(in_features * outlier_ratio))
+    _, idx = torch.topk(act_scale[:in_features].float(), k)
+    idx = idx.sort().values
+
+    s = awq_scale.float().clamp(min=1e-10)
+    w_zeroed = w.clone()
+    w_zeroed[:, idx] = 0.0
+    w_scaled = w_zeroed * s.unsqueeze(0)
+    flat = w_scaled.reshape(-1, group_size)
+    clip = clip_max.float().reshape(-1, 1)
+    flat = torch.clamp(flat, -clip, clip)
+    w_clipped = flat.reshape(w.shape)
+    w_dq = q40_roundtrip_dequant(w_clipped, group_size)
+    inv = 1.0 / s
+    w_eff = w_dq * inv.unsqueeze(0)
+    w_eff[:, idx] = w[:, idx]
+    return w_eff
+
+
+def awq_outlier_effective_weight(
+    w: torch.Tensor, awq_scale: torch.Tensor,
+    act_scale: torch.Tensor, group_size: int, outlier_ratio: float,
+) -> torch.Tensor:
+    """
+    AWQ + outlier FP32 protection:
+    - top k% input columns by activation magnitude stay FP32
+    - remaining columns: AWQ-scaled then Q4_0 round-trip
+    """
+    w = w.float()
+    out_features, in_features = w.shape
+    k = max(1, int(in_features * outlier_ratio))
+    _, idx = torch.topk(act_scale[:in_features].float(), k)
+    idx = idx.sort().values
+
+    s = awq_scale.float().clamp(min=1e-10)
+    w_zeroed = w.clone()
+    w_zeroed[:, idx] = 0.0
+    w_scaled = w_zeroed * s.unsqueeze(0)
+    w_dq = q40_roundtrip_dequant(w_scaled, group_size)
+    inv = 1.0 / s
+    w_eff = w_dq * inv.unsqueeze(0)
+    w_eff[:, idx] = w[:, idx]  # outlier cols keep original FP32
+    return w_eff
+
+
 def effective_weight_for_layer(
     w: torch.Tensor,
     short_name: str,
     awq_results: dict,
     group_size: int,
+    mode: str = "awq",
+    act_scales: dict | None = None,
+    outlier_ratio: float = 0.01,
 ) -> torch.Tensor:
     r = awq_results.get(short_name)
     if r is None or float(r.get("alpha", 0.0)) <= 0.0:
         return q40_roundtrip_dequant(w, group_size)
+
+    has_clip = "clip_max" in r and r["clip_max"] is not None
+    layer_name_map = getattr(effective_weight_for_layer, "_name_map", {})
+    hf_name = layer_name_map.get(short_name, short_name)
+
+    if mode == "awq_clip_outlier" and has_clip and act_scales is not None and hf_name in act_scales:
+        return awq_clip_outlier_effective_weight(
+            w, r["scale"], r["clip_max"], act_scales[hf_name], group_size, outlier_ratio
+        )
+    if mode == "awq_clip" and has_clip:
+        return awq_clip_effective_weight(w, r["scale"], r["clip_max"], group_size)
+    if mode == "awq_outlier" and act_scales is not None and hf_name in act_scales:
+        return awq_outlier_effective_weight(
+            w, r["scale"], act_scales[hf_name], group_size, outlier_ratio
+        )
     return awq_effective_weight(w, r["scale"], group_size)
 
 
@@ -124,7 +210,10 @@ def replace_quantized_linears(
     mode: str,
     awq_results: dict | None,
     dtype: torch.dtype,
+    act_scales: dict | None = None,
+    outlier_ratio: float = 0.01,
 ) -> None:
+    effective_weight_for_layer._name_map = layer_name_map
     device = next(model.parameters()).device
     for short, hf_prefix in layer_name_map.items():
         key = f"{hf_prefix}.weight"
@@ -135,9 +224,12 @@ def replace_quantized_linears(
             continue
         if mode == "naive":
             w_new = q40_roundtrip_dequant(w, group_size)
-        elif mode == "awq":
+        elif mode in ("awq", "awq_outlier", "awq_clip", "awq_clip_outlier"):
             assert awq_results is not None
-            w_new = effective_weight_for_layer(w, short, awq_results, group_size)
+            w_new = effective_weight_for_layer(
+                w, short, awq_results, group_size,
+                mode=mode, act_scales=act_scales, outlier_ratio=outlier_ratio,
+            )
         else:
             raise ValueError(mode)
         linear = get_module_by_name(model, hf_prefix)
@@ -153,7 +245,7 @@ def compute_awq_results(
     group_size: int,
     n_layers: int,
     wikitext_calib_samples: int,
-) -> dict:
+) -> tuple[dict, dict]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
@@ -191,11 +283,24 @@ def compute_awq_results(
         if a_samples is None or a_samples.shape[0] < 2:
             awq_results[short_name] = {"alpha": 0.0, "scale": torch.ones(w.shape[1])}
             continue
+        search_device = "cuda" if torch.cuda.is_available() else "cpu"
         best_alpha, best_scale, _, _ = grid_search_alpha(
-            w.cpu(), a_samples, a_scale, group_size
+            w.cpu(), a_samples, a_scale, group_size, device=search_device
         )
-        awq_results[short_name] = {"alpha": best_alpha, "scale": best_scale.cpu()}
-    return awq_results
+        clip_max = None
+        if best_alpha > 0 and short_name not in _SKIP_CLIP_NAMES:
+            clip_max = auto_clip_search(
+                w.cpu(), a_samples, best_scale.cpu(), group_size, device=search_device
+            )
+        print(f"    {short_name}: alpha={best_alpha:.2f}, clip={'yes' if clip_max is not None else 'no'}")
+        awq_results[short_name] = {
+            "alpha": best_alpha, "scale": best_scale.cpu(), "clip_max": clip_max,
+        }
+    act_scales_cpu = {k: v.cpu().float() for k, v in act_scales.items()}
+    return awq_results, act_scales_cpu
+
+
+_SKIP_CLIP_NAMES = set()
 
 
 def load_or_compute_awq_results(
@@ -207,11 +312,12 @@ def load_or_compute_awq_results(
     cache_path: Path | None,
     recompute: bool,
     wikitext_calib_samples: int,
-) -> dict:
+) -> tuple[dict, dict]:
     if cache_path and cache_path.is_file() and not recompute:
         blob = torch.load(cache_path, map_location="cpu")
-        return blob["awq_results"]
-    awq_results = compute_awq_results(
+        act_scales = blob.get("act_scales", {})
+        return blob["awq_results"], act_scales
+    awq_results, act_scales = compute_awq_results(
         model_dir,
         device,
         calibration,
@@ -224,6 +330,7 @@ def load_or_compute_awq_results(
         torch.save(
             {
                 "awq_results": awq_results,
+                "act_scales": act_scales,
                 "group_size": group_size,
                 "calibration": calibration,
                 "wikitext_calib_samples": wikitext_calib_samples,
@@ -231,8 +338,8 @@ def load_or_compute_awq_results(
             },
             cache_path,
         )
-        print(f"  Saved AWQ scales cache: {cache_path}")
-    return awq_results
+        print(f"  Saved AWQ+act_scales cache: {cache_path}")
+    return awq_results, act_scales
 
 
 def tokenize_wikitext_upto(
@@ -280,10 +387,10 @@ def eval_nll_chunks(
 
 
 def main():
-    p = argparse.ArgumentParser(description="WikiText-2 subset PPL: FP16 vs naive Q4_0 vs AWQ")
+    p = argparse.ArgumentParser(description="WikiText-2 PPL: FP16 vs Q4_0 vs AWQ vs AWQ+clip vs AWQ+clip+outlier")
     p.add_argument("--model_dir", type=str, required=True)
-    p.add_argument("--modes", type=str, default="fp16,naive,awq",
-                   help="Comma-separated: fp16,naive,awq")
+    p.add_argument("--modes", type=str, default="naive,awq,awq_clip,awq_clip_outlier",
+                   help="Comma-separated: fp16,naive,awq,awq_clip,awq_outlier,awq_clip_outlier")
     p.add_argument("--max_tokens", type=int, default=8192,
                    help="Eval 用的前 N 个 token（子集，跑得更快）")
     p.add_argument("--chunk_len", type=int, default=2048)
@@ -302,6 +409,8 @@ def main():
     p.add_argument("--cache_awq", type=str, default=None,
                    help="读写 AWQ 标定结果 (.pt)，避免重复跑 hooks")
     p.add_argument("--recompute_awq", action="store_true")
+    p.add_argument("--outlier_ratio", type=float, default=0.01,
+                   help="Fraction of input columns kept in FP32 for awq_outlier mode")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -313,9 +422,11 @@ def main():
     layer_name_map = build_layer_name_map(n_layers)
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
-    if "awq" in modes:
+    awq_modes = {"awq", "awq_outlier", "awq_clip", "awq_clip_outlier"}
+    need_awq = any(m in awq_modes for m in modes)
+    if need_awq:
         cache = Path(args.cache_awq) if args.cache_awq else None
-        awq_results = load_or_compute_awq_results(
+        awq_results, act_scales = load_or_compute_awq_results(
             model_dir,
             args.device,
             args.calibration,
@@ -327,6 +438,7 @@ def main():
         )
     else:
         awq_results = None
+        act_scales = {}
 
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -356,8 +468,10 @@ def main():
                 layer_name_map,
                 args.group_size,
                 mode,
-                awq_results if mode == "awq" else None,
+                awq_results if mode in awq_modes else None,
                 torch.float16,
+                act_scales=act_scales if mode in ("awq_outlier", "awq_clip_outlier") else None,
+                outlier_ratio=args.outlier_ratio,
             )
         ce_sum, n_tok = eval_nll_chunks(model, ids, args.chunk_len, args.device)
         nll = ce_sum / n_tok
@@ -386,6 +500,22 @@ def main():
         d = results["naive"][0] - results["awq"][0]
         pct = (math.exp(results["naive"][0]) / math.exp(results["awq"][0]) - 1.0) * 100
         print(f"  ΔNLL(naive - awq):  {d:+.4f}  (AWQ 更低更好；约 PPL 相对差 {pct:+.1f}%)")
+    if "naive" in results and "awq_outlier" in results:
+        d = results["naive"][0] - results["awq_outlier"][0]
+        pct = (math.exp(results["naive"][0]) / math.exp(results["awq_outlier"][0]) - 1.0) * 100
+        print(f"  ΔNLL(naive - awq_ol): {d:+.4f}  (AWQ+outlier 更低更好；约 PPL 相对差 {pct:+.1f}%)")
+    if "naive" in results and "awq_clip" in results:
+        d = results["naive"][0] - results["awq_clip"][0]
+        pct = (math.exp(results["naive"][0]) / math.exp(results["awq_clip"][0]) - 1.0) * 100
+        print(f"  ΔNLL(naive - awq_clip): {d:+.4f}  (AWQ+clip；约 PPL 相对差 {pct:+.1f}%)")
+    if "naive" in results and "awq_clip_outlier" in results:
+        d = results["naive"][0] - results["awq_clip_outlier"][0]
+        pct = (math.exp(results["naive"][0]) / math.exp(results["awq_clip_outlier"][0]) - 1.0) * 100
+        print(f"  ΔNLL(naive - awq_clip_ol): {d:+.4f}  (AWQ+clip+outlier；约 PPL 相对差 {pct:+.1f}%)")
+    if "awq" in results and "awq_outlier" in results:
+        d = results["awq"][0] - results["awq_outlier"][0]
+        pct = (math.exp(results["awq"][0]) / math.exp(results["awq_outlier"][0]) - 1.0) * 100
+        print(f"  ΔNLL(awq - awq_ol):   {d:+.4f}  (outlier 保护额外收益；约 PPL 相对差 {pct:+.1f}%)")
 
 
 if __name__ == "__main__":

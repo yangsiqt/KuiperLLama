@@ -73,6 +73,91 @@ def quantize_q40_with_awq(w, awq_scale, group_size):
     return packed, quant_scales, inv_awq_scale, err
 
 
+def select_outlier_columns(act_scale, in_features, ratio=0.01):
+    """Select top-k salient input columns by activation magnitude."""
+    k = max(1, int(in_features * ratio))
+    _, indices = torch.topk(act_scale[:in_features].float(), k)
+    return indices.sort().values
+
+
+def quantize_q40_with_awq_outlier(w, awq_scale, group_size, outlier_idx):
+    """
+    AWQ + outlier FP16 protection.
+    1. Extract outlier sub-matrix (original w, full precision)
+    2. Zero outlier columns in w, then AWQ-scale + Q4_0
+    Returns: packed, quant_scales, inv_awq_scale, outlier_weights (FP32), max_error
+    """
+    w = w.float()
+    out_features, in_features = w.shape
+    outlier_weights = w[:, outlier_idx].contiguous()  # (out, k) full precision
+
+    w_zeroed = w.clone()
+    w_zeroed[:, outlier_idx] = 0.0
+    w_scaled = w_zeroed * awq_scale.float().unsqueeze(0)
+    packed, quant_scales, err = quantize_q40(w_scaled, group_size)
+    inv_awq_scale = (1.0 / awq_scale.float()).contiguous()
+    return packed, quant_scales, inv_awq_scale, outlier_weights, err
+
+
+@torch.no_grad()
+def auto_clip_search(w, act_samples, awq_scale, group_size,
+                     n_grid=20, max_shrink=0.5, device="cpu"):
+    """
+    Search optimal per-group weight clipping to minimize quantization error.
+    Implements the auto_clip technique from the AWQ paper (Section 3.3).
+
+    w: (out, in) original FP32 weight
+    act_samples: (n_samples, in) calibration activations
+    awq_scale: (in,) AWQ scaling factor s
+    Returns: clip_max (n_total_groups,) per-group max abs value for clipping
+    """
+    w_scaled = (w.float() * awq_scale.float().unsqueeze(0)).to(device)
+    act_inv = (act_samples.float() * (1.0 / awq_scale.float().clamp(min=1e-10)).unsqueeze(0))
+
+    out_f, in_f = w_scaled.shape
+    n_groups_per_row = in_f // group_size
+    n_samples = min(act_inv.shape[0], 512)
+    act_inv = act_inv[:n_samples].to(device)
+
+    w_4d = w_scaled.reshape(out_f, 1, n_groups_per_row, group_size)
+    act_4d = act_inv.reshape(1, n_samples, n_groups_per_row, group_size)
+
+    oc_batch = 256 if out_f % 256 == 0 else (64 if out_f % 64 == 0 else out_f)
+    best_max_all = []
+
+    for i_b in range(out_f // oc_batch):
+        sl = slice(i_b * oc_batch, (i_b + 1) * oc_batch)
+        w_batch = w_4d[sl]
+        org_max = w_batch.abs().amax(dim=-1, keepdim=True)
+        best_max = org_max.clone()
+        min_errs = torch.full_like(org_max, 1e9)
+        org_out = (w_batch * act_4d).sum(dim=-1)
+
+        n_steps = int(max_shrink * n_grid)
+        for i_s in range(n_steps):
+            ratio = 1.0 - i_s / n_grid
+            max_val = org_max * ratio
+            cur_w = torch.clamp(w_batch, -max_val, max_val)
+
+            flat = cur_w.reshape(-1, group_size)
+            wmax = flat.abs().max(dim=1).values
+            scale = (wmax / 7.0).clamp(min=1e-10)
+            quant = (flat / scale[:, None]).round().clamp(-8, 7)
+            q_w = (quant * scale[:, None]).reshape(cur_w.shape)
+
+            cur_out = (act_4d * q_w).sum(dim=-1)
+            err = (cur_out - org_out).pow(2).mean(dim=1).view(min_errs.shape)
+
+            better = err < min_errs
+            min_errs[better] = err[better]
+            best_max[better] = max_val[better]
+
+        best_max_all.append(best_max.cpu())
+
+    result = torch.cat(best_max_all, dim=0).squeeze(1)  # (out, n_groups_per_row, 1)
+    return result.reshape(-1)  # (n_total_groups,)
+
+
 def compute_awq_error(w, act_samples, awq_scale, group_size):
     """
     Compute quantization error WITH AWQ scaling.
@@ -133,14 +218,19 @@ def compute_awq_error_fast(w, act_samples, awq_scale, group_size):
     return mse
 
 
-def grid_search_alpha(w, act_samples, act_scale, group_size, alphas=None):
+def grid_search_alpha(w, act_samples, act_scale, group_size, alphas=None,
+                      n_grid=20, device=None):
     """
     Grid search for optimal alpha.
-    s = act_scale^alpha, alpha in [0, 1]
-    Returns: best_alpha, best_scale, best_error
+    s = act_scale^alpha, normalized by geometric mean (official AWQ style).
     """
+    if device is not None:
+        w = w.float().to(device)
+        act_samples = act_samples.float().to(device)
+        act_scale = act_scale.float().to(device)
+
     if alphas is None:
-        alphas = [i * 0.1 for i in range(11)]
+        alphas = [i / n_grid for i in range(n_grid)]
 
     best_alpha = 0.0
     best_error = float('inf')
@@ -154,7 +244,7 @@ def grid_search_alpha(w, act_samples, act_scale, group_size, alphas=None):
             s = torch.ones_like(act_scale)
         else:
             s = act_scale.float().clamp(min=1e-5).pow(alpha)
-            s = s / s.mean() * 1.0
+            s = s / (s.max() * s.min()).sqrt().clamp(min=1e-10)
 
         err = compute_awq_error_fast(w, act_samples, s, group_size)
         if err < best_error:
@@ -162,6 +252,8 @@ def grid_search_alpha(w, act_samples, act_scale, group_size, alphas=None):
             best_alpha = alpha
             best_scale = s.clone()
 
+    if device is not None:
+        best_scale = best_scale.cpu()
     return best_alpha, best_scale, best_error, baseline_err
 
 
@@ -297,6 +389,8 @@ def main():
     parser.add_argument("--calibration", type=str, default="wikitext2",
                         choices=["builtin", "wikitext2"],
                         help="Calibration data: 'builtin' (8 hardcoded) or 'wikitext2' (128 samples)")
+    parser.add_argument("--outlier_ratio", type=float, default=0.0,
+                        help="Fraction of input columns kept in FP32 (e.g. 0.01 = 1%%). 0 = disabled.")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -416,7 +510,13 @@ def main():
                          num_kv_heads, vocab_size, max_seq_len, intermediate_size)
     out.write(header)
     out.write(struct.pack('i', group_size))
-    out.write(struct.pack('i', 1))  # awq_flag = 1
+    outlier_ratio = args.outlier_ratio
+    if outlier_ratio > 0:
+        out.write(struct.pack('i', 2))  # awq_flag = 2: AWQ + outlier FP32
+        out.write(struct.pack('f', outlier_ratio))
+        print(f"  outlier_ratio={outlier_ratio:.4f} (awq_flag=2)")
+    else:
+        out.write(struct.pack('i', 1))  # awq_flag = 1: AWQ only
 
     total_err_awq = 0.0
     total_err_naive = 0.0
@@ -430,10 +530,36 @@ def main():
 
         _, _, naive_err = quantize_q40(tensor, group_size)
         total_err_naive += naive_err
+        out_features, in_features = tensor.shape
 
         result = awq_results.get(short_name)
-        if result is not None and result['alpha'] > 0:
-            awq_scale = result['scale']
+        hf_name = layer_name_map.get(short_name, short_name)
+
+        has_awq_benefit = (result is not None and result['alpha'] > 0)
+        awq_scale = result['scale'] if has_awq_benefit else torch.ones(in_features)
+
+        if outlier_ratio > 0:
+            k = max(1, int(in_features * outlier_ratio))
+            if hf_name in act_scales:
+                a_scale = act_scales[hf_name].cpu().float()
+                outlier_idx = select_outlier_columns(a_scale, in_features, outlier_ratio)
+            else:
+                outlier_idx = torch.arange(k, dtype=torch.int64)
+            outlier_idx = outlier_idx[:k]
+            packed, quant_scales, inv_scale, outlier_w, awq_err = \
+                quantize_q40_with_awq_outlier(tensor, awq_scale, group_size, outlier_idx)
+            serialize_uint8(out, packed)
+            serialize_fp32(out, quant_scales)
+            serialize_fp32(out, inv_scale)
+            out.write(struct.pack('i', k))
+            out.write(struct.pack(f'{k}i', *outlier_idx.cpu().numpy().tolist()))
+            serialize_fp32(out, outlier_w)
+            total_err_awq += awq_err
+            n_quantized += 1
+            alpha_str = f"alpha={result['alpha']:.2f}, " if has_awq_benefit else ""
+            print(f"  [AWQ+OL] {short_name}: {list(tensor.shape)}, "
+                  f"{alpha_str}outlier_cols={k}")
+        elif has_awq_benefit:
             packed, quant_scales, inv_scale, awq_err = quantize_q40_with_awq(
                 tensor, awq_scale, group_size
             )
@@ -443,12 +569,12 @@ def main():
             total_err_awq += awq_err
             n_quantized += 1
             print(f"  [AWQ] {short_name}: {list(tensor.shape)}, "
-                  f"alpha={result['alpha']:.2f}, improvement={result['improvement']:+.1f}%")
+                  f"alpha={result['alpha']:.2f}, improvement={result.get('improvement',0):+.1f}%")
         else:
             packed, quant_scales, err = quantize_q40(tensor, group_size)
             serialize_uint8(out, packed)
             serialize_fp32(out, quant_scales)
-            inv_scale = torch.ones(tensor.shape[1], dtype=torch.float32)
+            inv_scale = torch.ones(in_features, dtype=torch.float32)
             serialize_fp32(out, inv_scale)
             total_err_awq += err
             n_quantized += 1

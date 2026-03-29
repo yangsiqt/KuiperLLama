@@ -74,6 +74,12 @@ base::Status MatmulLayer::forward() {
                                                    group_size_, scales_, awq_scales_,
                                                    dim0_, dim1_,
                                                    cuda_config_ ? cuda_config_.get() : nullptr);
+    if (has_outlier()) {
+      kernel::get_outlier_gemm_kernel(device_type_)(
+          get_input(0), outlier_weights_, outlier_indices_, get_output(0),
+          dim0_, get_outlier_count(),
+          cuda_config_ ? cuda_config_.get() : nullptr);
+    }
   } else if (is_quant_layer_) {
     kernel::get_matmul_kernel_quant8(device_type_)(get_input(0), get_weight(0), get_output(0),
                                                    group_size_, scales_,

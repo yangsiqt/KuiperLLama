@@ -16,6 +16,13 @@ void matmul_kernel_cu_qint4(const tensor::Tensor& input, const tensor::Tensor& w
                             const tensor::Tensor& scale, const tensor::Tensor& awq_scale,
                             int32_t dim0, int32_t dim1,
                             const CudaConfig* config = nullptr);
+
+void outlier_gemm_kernel_cu(const tensor::Tensor& input,
+                            const tensor::Tensor& outlier_weights,
+                            const tensor::Tensor& outlier_indices,
+                            const tensor::Tensor& output,
+                            int32_t dim0, int32_t n_outlier,
+                            const CudaConfig* config = nullptr);
 }  // namespace kernel
 
 #endif  // MATMUL_KERNEL_CU_CUH

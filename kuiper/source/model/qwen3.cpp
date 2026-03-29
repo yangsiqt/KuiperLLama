@@ -1,5 +1,6 @@
 #ifdef QWEN3_SUPPORT
 #include "model/qwen3.h"
+#include <algorithm>
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
 #include <op/matmul.h>
@@ -203,6 +204,11 @@ void Qwen3Model::create_param_quant_layers() {
     return layer;
   };
 
+  auto outlier_k = [&](int32_t d1) -> int32_t {
+    if (!has_outlier_) return 0;
+    return std::max(1, static_cast<int32_t>(d1 * outlier_ratio_));
+  };
+
   auto quant_weight_bytes = [&](int32_t d0, int32_t d1, int32_t scale_num) -> size_t {
     size_t bytes;
     if (quant_bits_ == 4) {
@@ -211,7 +217,13 @@ void Qwen3Model::create_param_quant_layers() {
       bytes = static_cast<size_t>(d0) * d1 + scale_num * sizeof(float);
     }
     if (has_awq_) {
-      bytes += static_cast<size_t>(d1) * sizeof(float);
+      bytes += static_cast<size_t>(d1) * sizeof(float);  // awq_input_scales
+      if (has_outlier_) {
+        int32_t k = outlier_k(d1);
+        bytes += sizeof(int32_t);  // n_outlier
+        bytes += k * sizeof(int32_t);  // indices
+        bytes += static_cast<size_t>(d0) * k * sizeof(float);  // fp32 weights
+      }
     }
     return bytes;
   };
@@ -233,6 +245,28 @@ void Qwen3Model::create_param_quant_layers() {
     tensor::Tensor awq_scales(base::DataType::kDataTypeFp32, d1, false, nullptr, awq_ptr);
     awq_scales.set_device_type(cpu_device_type);
     layer->set_awq_scales(awq_scales);
+
+    if (has_outlier_) {
+      size_t ol_offset = awq_offset + static_cast<size_t>(d1) * sizeof(float);
+      int32_t* n_ptr = reinterpret_cast<int32_t*>(
+          static_cast<int8_t*>(raw_model_data_->weight_data) + ol_offset);
+      int32_t k = *n_ptr;
+      ol_offset += sizeof(int32_t);
+
+      if (k > 0) {
+        int32_t* idx_ptr = reinterpret_cast<int32_t*>(
+            static_cast<int8_t*>(raw_model_data_->weight_data) + ol_offset);
+        tensor::Tensor indices(base::DataType::kDataTypeInt32, k, false, nullptr, idx_ptr);
+        indices.set_device_type(cpu_device_type);
+        ol_offset += k * sizeof(int32_t);
+
+        float* w_ptr = reinterpret_cast<float*>(
+            static_cast<int8_t*>(raw_model_data_->weight_data) + ol_offset);
+        tensor::Tensor outlier_w(base::DataType::kDataTypeFp32, d0 * k, false, nullptr, w_ptr);
+        outlier_w.set_device_type(cpu_device_type);
+        layer->set_outlier(indices, outlier_w);
+      }
+    }
   };
 
   // WQ

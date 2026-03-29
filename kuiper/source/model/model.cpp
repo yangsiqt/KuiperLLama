@@ -68,9 +68,17 @@ base::Status Model::read_model_file() {
     }
     if (has_awq_) {
       int32_t awq_flag = 0;
-      if (fread(&awq_flag, sizeof(int32_t), 1, file) != 1 || awq_flag != 1) {
+      if (fread(&awq_flag, sizeof(int32_t), 1, file) != 1 ||
+          (awq_flag != 1 && awq_flag != 2)) {
         return error::ModelParseError(
             "Failed to read AWQ flag from the model file.");
+      }
+      if (awq_flag == 2) {
+        has_outlier_ = true;
+        if (fread(&outlier_ratio_, sizeof(float), 1, file) != 1 || outlier_ratio_ <= 0.f) {
+          return error::ModelParseError(
+              "Failed to read outlier_ratio from the model file.");
+        }
       }
     }
   }
@@ -108,7 +116,10 @@ base::Status Model::read_model_file() {
   } else {
     size_t header_extra = sizeof(group_size_);
     if (has_awq_) {
-      header_extra += sizeof(int32_t);
+      header_extra += sizeof(int32_t);  // awq_flag
+      if (has_outlier_) {
+        header_extra += sizeof(float);  // outlier_ratio
+      }
     }
     raw_model_data_->weight_data =
         static_cast<int8_t*>(raw_model_data_->data) + sizeof(ModelConfig) + header_extra;

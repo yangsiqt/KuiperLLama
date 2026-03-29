@@ -83,6 +83,8 @@ class Model {
   int32_t quant_bits_ = 8;
   bool is_quant_model_ = false;
   bool has_awq_ = false;
+  bool has_outlier_ = false;
+  float outlier_ratio_ = 0.0f;
   std::unique_ptr<TransformerConfig> config_;
 
   std::string token_path_;

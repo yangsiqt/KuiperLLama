@@ -277,4 +277,52 @@ void matmul_kernel_cu_qint8(const tensor::Tensor& input, const tensor::Tensor& w
                                                   const_cast<float*>(output.ptr<float>()), M, K);
   }
 }
+// Outlier FP32 gather-GEMM: output[row] += sum_j W_outlier[row*k+j] * input[indices[j]]
+template <int THREAD_PER_BLOCK>
+__global__ void outlier_gemm_kernel_cu_impl(const float* __restrict__ input,
+                                            const float* __restrict__ outlier_weights,
+                                            const int32_t* __restrict__ outlier_indices,
+                                            float* __restrict__ output,
+                                            int K, int n_outlier) {
+  int row = blockIdx.x;
+  if (row >= K) return;
+  unsigned int tid = threadIdx.x;
+
+  float sum = 0.0f;
+  const float* w_row = outlier_weights + static_cast<size_t>(row) * n_outlier;
+  for (int j = tid; j < n_outlier; j += THREAD_PER_BLOCK) {
+    sum += w_row[j] * input[outlier_indices[j]];
+  }
+
+  using BlockReduce = cub::BlockReduce<float, THREAD_PER_BLOCK>;
+  __shared__ typename BlockReduce::TempStorage temp;
+  float total = BlockReduce(temp).Sum(sum);
+
+  if (tid == 0) {
+    output[row] += total;
+  }
+}
+
+void outlier_gemm_kernel_cu(const tensor::Tensor& input,
+                            const tensor::Tensor& outlier_weights,
+                            const tensor::Tensor& outlier_indices,
+                            const tensor::Tensor& output,
+                            int32_t dim0, int32_t n_outlier,
+                            const CudaConfig* config) {
+  CHECK(config != nullptr);
+  if (n_outlier <= 0) return;
+  const int32_t K = dim0;
+  if (config->stream) {
+    outlier_gemm_kernel_cu_impl<128><<<K, 128, 0, config->stream>>>(
+        input.ptr<float>(), outlier_weights.ptr<float>(),
+        outlier_indices.ptr<int32_t>(),
+        const_cast<float*>(output.ptr<float>()), K, n_outlier);
+  } else {
+    outlier_gemm_kernel_cu_impl<128><<<K, 128>>>(
+        input.ptr<float>(), outlier_weights.ptr<float>(),
+        outlier_indices.ptr<int32_t>(),
+        const_cast<float*>(output.ptr<float>()), K, n_outlier);
+  }
+}
+
 }  // namespace kernel

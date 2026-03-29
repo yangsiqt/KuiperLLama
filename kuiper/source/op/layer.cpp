@@ -182,6 +182,12 @@ void LayerParam::to_cuda() {
   if (!awq_scales_.is_empty()) {
     awq_scales_.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
   }
+  if (!outlier_indices_.is_empty()) {
+    outlier_indices_.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+  }
+  if (!outlier_weights_.is_empty()) {
+    outlier_weights_.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
+  }
 }
 
 base::Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dims,
@@ -258,6 +264,22 @@ void LayerParam::set_awq_scales(const tensor::Tensor& awq_scales) {
 const tensor::Tensor& LayerParam::get_awq_scales() const { return awq_scales_; }
 
 bool LayerParam::has_awq() const { return !awq_scales_.is_empty(); }
+
+void LayerParam::set_outlier(const tensor::Tensor& indices, const tensor::Tensor& weights) {
+  outlier_indices_ = indices;
+  outlier_weights_ = weights;
+}
+
+bool LayerParam::has_outlier() const { return !outlier_indices_.is_empty(); }
+
+const tensor::Tensor& LayerParam::get_outlier_indices() const { return outlier_indices_; }
+
+const tensor::Tensor& LayerParam::get_outlier_weights() const { return outlier_weights_; }
+
+int32_t LayerParam::get_outlier_count() const {
+  if (outlier_indices_.is_empty()) return 0;
+  return static_cast<int32_t>(outlier_indices_.size());
+}
 
 int32_t LayerParam::get_quant_bits() const { return quant_bits_; }
 
