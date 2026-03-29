@@ -235,6 +235,25 @@ def load_or_compute_awq_results(
     return awq_results
 
 
+def tokenize_wikitext_upto(
+    tokenizer, ds_split, max_tokens: int
+) -> torch.Tensor:
+    """按行增量编码，凑满 max_tokens，避免整集拼成超长串再 tokenize。"""
+    ids: list[int] = []
+    for row in ds_split["text"]:
+        text = row.strip() if isinstance(row, str) else ""
+        if not text:
+            continue
+        enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        tid = enc.input_ids[0]
+        take = min(tid.numel(), max_tokens - len(ids))
+        if take > 0:
+            ids.extend(tid[:take].tolist())
+        if len(ids) >= max_tokens:
+            break
+    return torch.tensor([ids], dtype=torch.long)
+
+
 @torch.inference_mode()
 def eval_nll_chunks(
     model: nn.Module,
@@ -314,11 +333,9 @@ def main():
 
     print(f"\n=== Loading WikiText-2 ({args.wikitext_split}) ===")
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=args.wikitext_split)
-    text = "\n\n".join(t for t in ds["text"] if t.strip())
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
-    ids = enc.input_ids[:, : args.max_tokens]
-    print(f"  Tokenized length (truncated): {ids.size(1)}")
+    ids = tokenize_wikitext_upto(tokenizer, ds, args.max_tokens)
+    print(f"  Tokenized length: {ids.size(1)}")
 
     sd = load_safetensors(model_dir)
     results: dict[str, tuple[float, float]] = {}
