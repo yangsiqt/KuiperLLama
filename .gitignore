@@ -6,5 +6,9 @@
 build/
 lib/
 
+# 本地缓存与 bench 日志（勿提交）
+.cache/
+logs/
+
 # Project notes
 
